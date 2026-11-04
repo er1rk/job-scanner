@@ -201,7 +201,12 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
     }
     for attempt in range(3):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['gemini_model']}:generateContent"
-        r = requests.post(url, params={"key": api_key}, json=body, timeout=60)
+        try:
+            r = requests.post(url, params={"key": api_key}, json=body, timeout=120)
+        except requests.RequestException as e:  # timeout / connection drop - retry, never crash the run
+            print(f"  Gemini request failed ({type(e).__name__}), retrying", file=sys.stderr)
+            time.sleep(10)
+            continue
         if r.status_code == 429:  # free-tier rate limit
             time.sleep(30 * (attempt + 1))
             continue
