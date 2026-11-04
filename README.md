@@ -8,6 +8,7 @@ A small automation that finds fresh job offers and scores them against my profil
 ## How it works
 1. `scanner.py` pulls offers posted in the last 24 h for the searches in `config.yaml`.
 2. Obvious mismatches (e.g. *senior*, *internship*) are dropped by title before any AI call, saving tokens.
+   At most `max_offers_per_run` offers are scored per run; the rest go to a **queue** in the database and are scored first on the next run (queued offers older than `queue_max_age_days` are dropped, failed ones are retried up to 3 times). The digest says how many offers are still waiting.
 3. Each remaining offer is sent to Gemini in **one call** that returns a JSON object enforced by a schema:
    - **fit** – score from a recruiter-style rubric (mandatory requirements 40, experience 20, education 15, languages 10, nice-to-haves 15), verdict, strengths, gaps (as short reusable skill names), one-line reason;
    - **facts about the offer** – role category, industry, work mode, contract types, salary range (currency, period, gross/net), years required, English level, whether Polish is required, required and nice-to-have tools.
@@ -33,7 +34,8 @@ Gap names are merged case-insensitively. On report days the CSV is attached to t
 | table | one row per | main columns |
 |---|---|---|
 | `offers` | scored offer | title, company, location, score, verdict, gaps, role_category, work_mode, salary_min/max_pln_month, required_tools, english_level, notified, user_label, status |
-| `runs` | scanner run | started/finished, searches, cards found, dropped by title, scored, failed, notified, model |
+| `runs` | scanner run | started/finished, searches, cards found, dropped by title, scored, failed, notified, queued, model |
+| `queue` | offer waiting to be scored | offer details, queued at, failed attempts |
 
 List fields (gaps, tools, contract types) are exported to CSV joined with ` | ` – in Power Query use *Split column → By delimiter → Rows* to count e.g. the most common gaps.
 

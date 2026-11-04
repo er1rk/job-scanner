@@ -32,8 +32,12 @@ exclude_title_keywords:
   - stażyst
   - praktyk
 
-# Safety cap on AI calls per run
-max_offers_per_run: 80
+# Max offers scored per run (Gemini calls). Offers over the cap are queued and scored first on the
+# next run, so nothing is lost. ~150 offers take ~20 minutes and fit the free tier.
+max_offers_per_run: 150
+
+# Queued offers older than this are dropped (they are usually closed by then)
+queue_max_age_days: 7
 
 # Offers scoring at least this much are e-mailed
 min_score_to_notify: 60
