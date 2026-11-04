@@ -123,24 +123,41 @@ def parse_detail(html: str) -> str:
     return (text + "\n\n" + "\n".join(criteria)).strip()
 
 
+def build_searches(cfg: dict) -> list[dict]:
+    """Every keyword x every location, plus remote-in-Poland, plus any explicit 'searches'."""
+    searches = list(cfg.get("searches") or [])
+    for kw in cfg.get("keywords", []):
+        for loc in cfg.get("locations", []):
+            searches.append({"keywords": kw, "location": loc})
+        if cfg.get("include_remote_poland"):
+            searches.append({"keywords": kw, "location": "Poland", "remote": True})
+    return searches
+
+
 def fetch_offers(cfg: dict, seen: set) -> list[dict]:
     secs = int(cfg["posted_within_hours"]) * 3600
     excluded = [w.lower() for w in cfg.get("exclude_title_keywords", [])]
     found: dict[str, dict] = {}
-    for s in cfg["searches"]:
+    for s in build_searches(cfg):
         for page in range(int(cfg.get("pages_per_search", 1))):
             url = SEARCH_URL.format(kw=quote_plus(s["keywords"]), loc=quote_plus(s["location"]),
                                     secs=secs, start=page * 25)
+            if s.get("remote"):
+                url += "&f_WT=2"  # LinkedIn filter: remote only
             html = get(url)
             if not html:
                 break
-            for o in parse_search(html):
+            cards = parse_search(html)
+            for o in cards:
                 if o["id"] in seen or o["id"] in found:
                     continue
                 if any(w in o["title"].lower() for w in excluded):
                     continue
                 found[o["id"]] = o
             time.sleep(2)
+            if len(cards) < 25:  # no more pages
+                break
+    print(f"Searches run: {len(build_searches(cfg))}, unique new offers: {len(found)}")
     return list(found.values())[: int(cfg["max_offers_per_run"])]
 
 
