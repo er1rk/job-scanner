@@ -83,6 +83,15 @@ CREATE TABLE IF NOT EXISTS queue (               -- offers found but not scored 
     queued_at TEXT NOT NULL,
     attempts  INTEGER NOT NULL DEFAULT 0         -- failed scoring attempts
 );
+CREATE TABLE IF NOT EXISTS triaged (             -- dropped by the AI pre-filter (title-only), kept for review
+    id         TEXT PRIMARY KEY,
+    source     TEXT,
+    title      TEXT,
+    company    TEXT,
+    location   TEXT,
+    url        TEXT,
+    triaged_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS seen (                -- ids skipped without scoring (e.g. empty description)
     id TEXT PRIMARY KEY
 );
@@ -116,7 +125,8 @@ class Store:
         self.con.row_factory = sqlite3.Row
         self.con.executescript(SCHEMA_SQL)
         # columns added after the first release (CREATE TABLE IF NOT EXISTS doesn't add them to old files)
-        for table, cols in {"runs": {"queued": "INTEGER", "queue_expired": "INTEGER", "sources": "TEXT"},
+        for table, cols in {"runs": {"queued": "INTEGER", "queue_expired": "INTEGER", "sources": "TEXT",
+                                     "triaged_out": "INTEGER"},
                             "offers": {"fingerprint": "TEXT"}}.items():
             have = {r[1] for r in self.con.execute(f"PRAGMA table_info({table})")}
             for col, typ in cols.items():
@@ -190,6 +200,19 @@ class Store:
             "SELECT fingerprint FROM offers WHERE fingerprint IS NOT NULL AND first_seen >= ?", (cutoff,))}
         fps |= {o.get("fingerprint") for o in self.queued() if o.get("fingerprint")}
         return fps
+
+    def save_triaged(self, offers: list[dict]) -> None:
+        self.con.executemany(
+            "INSERT OR IGNORE INTO triaged(id, source, title, company, location, url, triaged_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(o["id"], o.get("source"), o.get("title"), o.get("company"), o.get("location"), o.get("url"), now_iso())
+             for o in offers])
+        self.con.executemany("INSERT OR IGNORE INTO seen(id) VALUES (?)", [(o["id"],) for o in offers])
+        self.con.commit()
+
+    def triaged_since(self, since_iso: str) -> list[dict]:
+        return [dict(r) for r in self.con.execute(
+            "SELECT * FROM triaged WHERE triaged_at >= ? ORDER BY triaged_at", (since_iso,))]
 
     def queue_size(self) -> int:
         return self.con.execute("SELECT COUNT(*) FROM queue").fetchone()[0]

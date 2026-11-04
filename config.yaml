@@ -39,6 +39,11 @@ exclude_title_keywords:
   - stażyst
   - praktyk
 
+# AI pre-filter: before the detailed scoring, Gemini sees only titles (batches of triage_batch_size per call)
+# and drops clear mismatches. Keeps everything if a call fails. Set to false to switch off.
+triage: true
+triage_batch_size: 60
+
 # Max offers scored per run (Gemini calls). Offers over the cap are queued and scored first on the
 # next run, so nothing is lost. ~150 offers take ~20 minutes and fit the free tier.
 max_offers_per_run: 150
