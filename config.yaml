@@ -1,0 +1,39 @@
+# What to search for on LinkedIn (public job search, no login needed)
+searches:
+  - keywords: "data analyst"
+    location: "Warsaw, Poland"
+  - keywords: "AML analyst"
+    location: "Poland"
+  - keywords: "KYC analyst"
+    location: "Poland"
+  - keywords: "reporting analyst"
+    location: "Poznań, Poland"
+  - keywords: "business analyst"
+    location: "Łódź, Poland"
+
+# Only offers posted in the last N hours
+posted_within_hours: 24
+
+# How many result pages (25 offers each) to read per search
+pages_per_search: 1
+
+# Skip offers whose title contains any of these words (case-insensitive) before calling the AI
+exclude_title_keywords:
+  - senior
+  - lead
+  - head of
+  - director
+  - manager
+  - intern
+  - internship
+  - staż
+  - praktyk
+
+# Safety cap on AI calls per run (Gemini free tier is rate-limited)
+max_offers_per_run: 40
+
+# Offers scoring at least this much are e-mailed
+min_score_to_notify: 60
+
+# Gemini model
+gemini_model: "gemini-2.5-flash"
