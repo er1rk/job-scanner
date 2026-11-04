@@ -33,11 +33,12 @@ import yaml
 from bs4 import BeautifulSoup
 
 import report
-from storage import Store, now_iso
+from storage import Store, decrypt_file, encrypt_file, now_iso
 
 ROOT = Path(__file__).parent
 SEEN_FILE = ROOT / "data" / "seen.json"   # legacy cache, migrated into the database on first run
 DB_FILE = ROOT / "data" / "jobs.db"
+DB_ENC_FILE = ROOT / "data" / "jobs.db.enc"   # the only form that is cached in GitHub Actions
 CSV_FILE = ROOT / "data" / "jobs.csv"
 REPORT_FILE = ROOT / "data" / "report.html"
 HEADERS = {
@@ -55,8 +56,21 @@ VIEW_URL = "https://www.linkedin.com/jobs/view/{id}/"
 
 # ---------------------------------------------------------------- helpers
 def load_config() -> dict:
+    """Public defaults from config.yaml, overridden by a private config that never lands in the repo:
+    the PRIVATE_CONFIG secret (YAML text) in GitHub Actions, or config.private.yaml locally (git-ignored).
+    Keys are replaced as a whole, e.g. a private `keywords` list replaces the public one."""
     with open(ROOT / "config.yaml", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
+    private = os.getenv("PRIVATE_CONFIG")
+    if not private and (ROOT / "config.private.yaml").exists():
+        private = (ROOT / "config.private.yaml").read_text(encoding="utf-8")
+    if private:
+        override = yaml.safe_load(private)
+        if not isinstance(override, dict):
+            sys.exit("PRIVATE_CONFIG must be YAML key: value pairs")
+        cfg.update(override)
+        print(f"Private config applied ({len(override)} keys)")  # key count only - logs are public
+    return cfg
 
 
 def load_profile() -> str:
@@ -176,12 +190,26 @@ required language they don't speak, far more years required). Do NOT penalise wo
 Never assume skills the profile does not state. Answer in English.
 
 Write each gap as a short, reusable skill/requirement name (e.g. "SQL", "SAP", "German C1",
-"3+ years in AML") so gaps can be counted across many offers.
+"3+ years experience") so gaps can be counted across many offers.
 
 Also extract facts from the offer itself (independent of the candidate). Use null when the offer
 does not state something - never guess salaries. Salary: copy the numbers as written, with their
 currency, period (hour/day/month/year) and whether they are gross, net or B2B net ("unknown" if unclear).
 required_tools / nice_to_have_tools: concrete tools and technologies only (Excel, Power BI, SQL, Python, SAP...)."""
+
+DEFAULT_ROLE_CATEGORIES = ["data/analytics", "finance", "operations", "engineering",
+                           "sales/marketing", "other"]
+
+
+def build_schema(cfg: dict) -> dict:
+    """Role categories come from the (private) config, so the public code doesn't reveal target roles."""
+    cats = [str(c) for c in (cfg.get("role_categories") or DEFAULT_ROLE_CATEGORIES)]
+    if "other" not in cats:
+        cats.append("other")
+    schema = json.loads(json.dumps(SCHEMA))
+    schema["properties"]["role_category"]["enum"] = cats
+    return schema
+
 
 SCHEMA = {
     "type": "OBJECT",
@@ -194,9 +222,7 @@ SCHEMA = {
         "gaps": {"type": "ARRAY", "items": {"type": "STRING"}},
         "one_line_reason": {"type": "STRING"},
         # --- facts about the offer
-        "role_category": {"type": "STRING", "enum": [
-            "data/BI analytics", "fraud/AML/KYC/compliance", "risk", "trust & safety/brand protection",
-            "business analysis", "finance/operations", "AI/data annotation", "other"]},
+        "role_category": {"type": "STRING", "enum": DEFAULT_ROLE_CATEGORIES},  # replaced by build_schema
         "industry": {"type": "STRING", "nullable": True},
         "work_mode": {"type": "STRING", "enum": ["remote", "hybrid", "on-site", "unknown"]},
         "contract_types": {"type": "ARRAY", "items": {"type": "STRING", "enum": [
@@ -320,7 +346,7 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
         f"Title: {offer['title']}\nCompany: {offer['company']}\nLocation: {offer['location']}\n\n"
         f"{description[:12000]}"
     )
-    result = call_gemini(prompt, SCHEMA, cfg, api_key)
+    result = call_gemini(prompt, build_schema(cfg), cfg, api_key)
     if not result:
         return None
     result["score"] = max(0, min(100, int(result.get("score") or 0)))
@@ -408,6 +434,27 @@ def send_weekly_report(store: Store, cfg: dict, profile: str | None, api_key: st
     return {"stats": stats, "recs": recs, "html": body}
 
 
+# ---------------------------------------------------------------- encrypted database
+def open_db() -> Store:
+    """Decrypt data/jobs.db.enc (if present) and open the database.
+    In GitHub Actions a key is mandatory, so an unencrypted database can never end up in the cache."""
+    key = os.getenv("DB_ENCRYPTION_KEY")
+    if os.getenv("GITHUB_ACTIONS") == "true" and not key:
+        sys.exit("Set the DB_ENCRYPTION_KEY secret - the database is only cached encrypted.")
+    if key and DB_ENC_FILE.exists():
+        decrypt_file(DB_ENC_FILE, DB_FILE, key)
+    return Store(DB_FILE)
+
+
+def close_db(store: Store) -> None:
+    """Close the database and, if a key is set, replace it with the encrypted copy."""
+    store.close()
+    key = os.getenv("DB_ENCRYPTION_KEY")
+    if key and DB_FILE.exists():
+        encrypt_file(DB_FILE, DB_ENC_FILE, key)
+        DB_FILE.unlink()
+
+
 # ---------------------------------------------------------------- main
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -419,13 +466,13 @@ def main() -> None:
 
     cfg = load_config()
     if args.export:
-        store = Store(DB_FILE)
+        store = open_db()
         CSV_FILE.write_text(store.export_csv(), encoding="utf-8")
         print(f"Exported {store.count()} offers to {CSV_FILE}")
-        store.close()
+        close_db(store)
         return
     if args.report:
-        store = Store(DB_FILE)
+        store = open_db()
         stats = report.compute_stats(store, threshold=cfg["min_score_to_notify"])
         key = os.getenv("GEMINI_API_KEY")
         recs = report.ai_recommendations(
@@ -433,7 +480,7 @@ def main() -> None:
         REPORT_FILE.write_text(report.build_report_html(stats, recs), encoding="utf-8")
         print(report.report_text(stats, recs))
         print(f"Report written to {REPORT_FILE}")
-        store.close()
+        close_db(store)
         return
 
     # Optional overrides for manual test runs (set from the "Run workflow" form)
@@ -448,7 +495,7 @@ def main() -> None:
     api_key = os.getenv("GEMINI_API_KEY") or sys.exit("Set GEMINI_API_KEY")
 
     # dry runs use a throw-away in-memory database, so they never change saved state
-    store = Store(Path(":memory:") if args.dry_run else DB_FILE)
+    store = Store(Path(":memory:")) if args.dry_run else open_db()
     if not args.dry_run:
         migrated = store.import_legacy_seen(SEEN_FILE)
         if migrated:
@@ -513,7 +560,7 @@ def main() -> None:
 
     store.save_run({**stats, "finished_at": now_iso(), "scored": len(results), "failed": failed,
                     "notified": len(good), "model": cfg["gemini_model"]})
-    store.close()
+    close_db(store)
 
 
 if __name__ == "__main__":

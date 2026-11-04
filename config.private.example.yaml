@@ -1,0 +1,20 @@
+# Copy to config.private.yaml (git-ignored) for local runs, or paste the content into the
+# PRIVATE_CONFIG repository secret for GitHub Actions. Every key replaces the same key in config.yaml.
+
+keywords:
+  - "your role 1"
+  - "your role 2"
+
+locations:
+  - "Your City, Country"
+
+exclude_title_keywords:
+  - senior
+  - intern
+
+role_categories:
+  - "category A"
+  - "category B"
+  - "other"
+
+min_score_to_notify: 60

@@ -38,12 +38,16 @@ Gap names are merged case-insensitively. On report days the CSV is attached to t
 List fields (gaps, tools, contract types) are exported to CSV joined with ` | ` – in Power Query use *Split column → By delimiter → Rows* to count e.g. the most common gaps.
 
 ## Privacy
-The real candidate profile and all API keys live in GitHub Secrets. The database is kept in the GitHub Actions cache, not in the repo, and logs print counts only, so the repo can stay public.
+The repo is public; everything personal stays out of it:
+- **Candidate profile, API keys and search settings** live in GitHub Secrets. `config.yaml` holds only neutral public defaults; the real keywords, locations, exclusions and role categories come from the `PRIVATE_CONFIG` secret (or a git-ignored `config.private.yaml` locally) and replace those keys.
+- **The database** is kept in the GitHub Actions cache, never in the repo, and only **encrypted** (Fernet, key in the `DB_ENCRYPTION_KEY` secret). A run in Actions without the key stops instead of caching plaintext.
+- **Reports and digests** go only to the configured e-mail address.
+- **Logs** print counts only – no offer titles, gap names or config values.
 
 ## Setup
 1. Get a Gemini API key at https://aistudio.google.com/apikey
 2. Create a Gmail app password (Google Account → Security → 2-Step Verification → App passwords)
-3. Add repository secrets: `GEMINI_API_KEY`, `CANDIDATE_PROFILE`, `EMAIL_ADDRESS`, `EMAIL_APP_PASSWORD` (optional `EMAIL_TO`)
+3. Add repository secrets: `GEMINI_API_KEY`, `CANDIDATE_PROFILE`, `EMAIL_ADDRESS`, `EMAIL_APP_PASSWORD`, `DB_ENCRYPTION_KEY` (a long random passphrase – keep a copy, without it the stored data can't be read), `PRIVATE_CONFIG` (your search settings in the format of `config.private.example.yaml`); optional `EMAIL_TO`
 4. Actions → *Daily job scan* → *Run workflow* to test (tick *Attach the full dataset* / *Send the weekly report* to get them right away)
 
 Local use:
@@ -57,4 +61,4 @@ python -m unittest -v           # offline tests (no network, no API key)
 ```
 
 ## Tech
-Python · requests · BeautifulSoup · Google Gemini API (structured output) · SQLite · SMTP e-mail · GitHub Actions (cron, secrets, cache)
+Python · requests · BeautifulSoup · Google Gemini API (structured output) · SQLite (encrypted at rest) · SMTP e-mail · GitHub Actions (cron, secrets, cache)

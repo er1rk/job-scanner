@@ -1,27 +1,12 @@
-# Every keyword is searched in every location below (+ remote in Poland).
+# PUBLIC DEFAULTS. The real search settings live in the PRIVATE_CONFIG secret (or a local,
+# git-ignored config.private.yaml) and replace these keys - see config.private.example.yaml.
+
+# Every keyword is searched in every location below (+ remote in the country, if enabled).
 keywords:
   - "data analyst"
-  - "reporting analyst"
-  - "business analyst"
-  - "BI analyst"
-  - "data quality analyst"
-  - "AML analyst"
-  - "KYC analyst"
-  - "fraud analyst"
-  - "risk analyst"
-  - "compliance analyst"
-  - "financial crime"
-  - "trust and safety"
-  - "brand protection"
-  - "payments analyst"
-  - "operations analyst"
-  - "sales analyst"
 
 locations:
   - "Warsaw, Poland"
-  - "Poznań, Poland"
-  - "Łódź, Poland"
-  - "Szczecin, Poland"
 
 include_remote_poland: true
 
@@ -52,6 +37,9 @@ max_offers_per_run: 80
 
 # Offers scoring at least this much are e-mailed
 min_score_to_notify: 60
+
+# Categories Gemini sorts offers into (set your own in the private config)
+role_categories: ["data/analytics", "finance", "operations", "engineering", "sales/marketing", "other"]
 
 # Gemini model (if unavailable, the script picks an available Flash model automatically)
 gemini_model: "gemini-flash-lite-latest"

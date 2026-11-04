@@ -29,7 +29,7 @@ GEMINI_RESULT = {
     "score": 82, "verdict": "apply", "seniority": "junior",
     "strengths": ["Power BI", "2 years data reporting"], "gaps": ["SQL"],
     "one_line_reason": "Strong reporting fit.",
-    "role_category": "data/BI analytics", "industry": "fintech", "work_mode": "hybrid",
+    "role_category": "data/analytics", "industry": "retail", "work_mode": "hybrid",
     "contract_types": ["employment contract"], "salary_min": 8000, "salary_max": 11000,
     "salary_currency": "PLN", "salary_period": "month", "salary_type": "gross",
     "years_required": 1, "english_level": "B2", "polish_required": True,
@@ -77,7 +77,7 @@ class StoreTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_save_export_and_keep_labels_on_rescore(self):
-        row = {"id": "1", "title": "Analityk danych", "company": "Żabka", "location": "Poznań",
+        row = {"id": "1", "title": "Analityk danych", "company": "Żabka", "location": "Kraków",
                "url": "u", **GEMINI_RESULT}
         self.store.save_offer(row, "opis oferty")
         self.store.con.execute("UPDATE offers SET user_label='applied', first_seen='2026-01-01' WHERE id='1'")
@@ -110,6 +110,7 @@ class EndToEndTests(unittest.TestCase):
         with mock.patch.object(scanner, "DB_FILE", Path(tmp) / "jobs.db"), \
              mock.patch.object(scanner, "SEEN_FILE", Path(tmp) / "seen.json"), \
              mock.patch.object(scanner, "CSV_FILE", Path(tmp) / "jobs.csv"), \
+             mock.patch.object(scanner, "DB_ENC_FILE", Path(tmp) / "jobs.db.enc"), \
              mock.patch.object(scanner, "get", side_effect=fake_get), \
              mock.patch.object(scanner.requests, "post", side_effect=fake_gemini), \
              mock.patch.object(scanner.time, "sleep"), \
@@ -117,7 +118,8 @@ class EndToEndTests(unittest.TestCase):
              mock.patch.object(scanner, "send_weekly_report") as weekly, \
              mock.patch.object(scanner, "send_email") as send, \
              mock.patch.object(sys, "argv", ["scanner.py", *argv]), \
-             mock.patch.dict(os.environ, {"GEMINI_API_KEY": "x", "CANDIDATE_PROFILE": "profile", **env}):
+             mock.patch.dict(os.environ, {"GEMINI_API_KEY": "x", "CANDIDATE_PROFILE": "profile",
+                                          "GITHUB_ACTIONS": "", "DB_ENCRYPTION_KEY": "", **env}):
             scanner.main()
         self.weekly = weekly
         return send
@@ -149,6 +151,25 @@ class EndToEndTests(unittest.TestCase):
             self.assertIsNone(send.call_args.args[1])           # digest without CSV
             self.assertIn("8000", self.weekly.call_args.args[4])  # report carries it
 
+    def test_encrypted_database_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"DB_ENCRYPTION_KEY": "a long passphrase made up just for this test"}
+            self.run_main(tmp, [], env)
+            self.assertFalse((Path(tmp) / "jobs.db").exists())         # plaintext removed
+            enc = (Path(tmp) / "jobs.db.enc").read_bytes()
+            self.assertNotIn(b"Data Analyst", enc)
+            self.assertNotIn(b"SQLite", enc)
+            send2 = self.run_main(tmp, [], env)                         # decrypts -> offer already known
+            send2.assert_not_called()
+            with self.assertRaises(SystemExit):
+                self.run_main(tmp, [], {"DB_ENCRYPTION_KEY": "wrong key"})
+
+    def test_ci_requires_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                self.run_main(tmp, [], {"GITHUB_ACTIONS": "true"})
+            self.assertFalse((Path(tmp) / "jobs.db").exists())
+
     def test_dry_run_saves_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             send = self.run_main(tmp, ["--dry-run"], {})
@@ -164,13 +185,42 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("0 offers", scanner.build_email([], None, "found 0 offers"))
 
 
+class PrivateConfigTests(unittest.TestCase):
+    def test_private_config_overrides_public_keys(self):
+        private = "keywords: [secret role]\nrole_categories: [alpha, beta]\n"
+        with mock.patch.dict(os.environ, {"PRIVATE_CONFIG": private}):
+            cfg = scanner.load_config()
+        self.assertEqual(cfg["keywords"], ["secret role"])
+        self.assertIn("gemini_model", cfg)                              # public keys kept
+        enum = scanner.build_schema(cfg)["properties"]["role_category"]["enum"]
+        self.assertEqual(enum, ["alpha", "beta", "other"])
+        self.assertEqual(scanner.SCHEMA["properties"]["role_category"]["enum"],
+                         scanner.DEFAULT_ROLE_CATEGORIES)               # global schema untouched
+
+    def test_invalid_private_config(self):
+        with mock.patch.dict(os.environ, {"PRIVATE_CONFIG": "- just a list"}):
+            with self.assertRaises(SystemExit):
+                scanner.load_config()
+
+    def test_fernet_key_also_accepted(self):
+        from cryptography.fernet import Fernet
+        from storage import decrypt_file, encrypt_file
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b, c = (Path(tmp) / n for n in "abc")
+            a.write_bytes(b"hello")
+            key = Fernet.generate_key().decode()
+            encrypt_file(a, b, key)
+            decrypt_file(b, c, key)
+            self.assertEqual(c.read_bytes(), b"hello")
+
+
 class ReportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.tmp.name) / "jobs.db")
         from datetime import datetime, timedelta, timezone
         self.now = datetime.now(timezone.utc)
-        def add(i, score, gaps, days_ago, tools=("Excel",), cat="data/BI analytics", sal=None):
+        def add(i, score, gaps, days_ago, tools=("Excel",), cat="data/analytics", sal=None):
             self.store.save_offer({"id": str(i), "title": f"Job {i}", "company": "C", "url": f"https://x/{i}",
                                    "score": score, "verdict": "apply" if score >= 60 else "stretch",
                                    "strengths": [], "gaps": list(gaps), "one_line_reason": "",
@@ -182,7 +232,7 @@ class ReportTests(unittest.TestCase):
         for i in range(6):
             add(i, 50, ["SQL", "German B2"] if i < 3 else ["sql"], 1, tools=("SQL", "Excel"), sal=8000 + i * 100)
         for i in range(6, 12):
-            add(i, 75, ["Python"], 2, cat="fraud/AML/KYC/compliance")
+            add(i, 75, ["Python"], 2, cat="finance")
         # previous week: 2 offers with SQL gap, plus one too old to count
         add(20, 50, ["SQL"], 9)
         add(21, 50, ["SQL"], 10)

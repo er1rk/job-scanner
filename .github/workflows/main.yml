@@ -49,18 +49,20 @@ jobs:
           key: seen-legacy
           restore-keys: seen-
 
-      # The database lives in the Actions cache (private - not visible in the public repo).
+      # The database is cached ONLY encrypted (key in the DB_ENCRYPTION_KEY secret).
       # A new cache entry is saved after every run; the newest one is restored next time.
       - uses: actions/cache@v4
         with:
-          path: data/
-          key: jobdb-${{ github.run_id }}
-          restore-keys: jobdb-
+          path: data/jobs.db.enc
+          key: jobdb-enc-${{ github.run_id }}
+          restore-keys: jobdb-enc-
 
       - name: Scan and score offers
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CANDIDATE_PROFILE: ${{ secrets.CANDIDATE_PROFILE }}
+          PRIVATE_CONFIG: ${{ secrets.PRIVATE_CONFIG }}
+          DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           HOURS: ${{ inputs.hours }}
