@@ -2,12 +2,13 @@
 
 A small automation that finds fresh job offers and scores them against my profile with an LLM, so every morning I only read the offers worth applying to. Every scored offer is also stored, so over time the scanner builds a dataset of the job market I'm targeting.
 
-**Pipeline:** LinkedIn public job search → title filter → Google Gemini (structured JSON: fit score + extracted facts) → SQLite → daily HTML e-mail + weekly market & skill-gap report (with CSV export for Power BI)
+**Pipeline:** LinkedIn + pracuj.pl + No Fluff Jobs + justjoin.it → title filter → cross-portal de-duplication → Google Gemini (structured JSON: fit score + extracted facts) → SQLite → daily HTML e-mail + weekly market & skill-gap report (with CSV export for Power BI)
 **Runs:** every weekday on GitHub Actions (free), no server needed.
 
 ## How it works
-1. `scanner.py` pulls offers posted in the last 24 h for the searches in `config.yaml`.
-2. Obvious mismatches (e.g. *senior*, *internship*) are dropped by title before any AI call, saving tokens.
+1. `scanner.py` pulls offers posted in the last 24 h for the searches in `config.yaml` from every portal listed under `sources` (one module per portal in `sources/`: LinkedIn's public job search, the JSON pracuj.pl embeds in its pages, the No Fluff Jobs API and the justjoin.it API). A portal that fails doesn't stop the others – the e-mail says which one broke.
+   The same job is often listed on several portals; offers with the same normalised company + title (legal forms like *Sp. z o.o.* and gender tags like *(k/m)* removed) are scored only once. When the per-run cap is reached, portals share it round-robin.
+2. Obvious mismatches (e.g. *senior*, *internship*) are dropped by title before any AI call, saving tokens. Optionally `include_title_keywords` keeps only titles containing one of the given words – useful because some portals match keywords loosely.
    At most `max_offers_per_run` offers are scored per run; the rest go to a **queue** in the database and are scored first on the next run (queued offers older than `queue_max_age_days` are dropped, failed ones are retried up to 3 times). The digest says how many offers are still waiting.
 3. Each remaining offer is sent to Gemini in **one call** that returns a JSON object enforced by a schema:
    - **fit** – score from a recruiter-style rubric (mandatory requirements 40, experience 20, education 15, languages 10, nice-to-haves 15), verdict, strengths, gaps (as short reusable skill names), one-line reason;
@@ -25,7 +26,7 @@ All numbers are computed in Python straight from the database; the LLM only rece
 - **what blocks near-miss offers** – the gaps in offers that scored just below the e-mail threshold (default 40–59). These are the most actionable: closing them turns real offers into "apply";
 - most common gaps overall with the week-over-week trend;
 - most required tools, and in how many of those offers the tool was the candidate's gap;
-- categories with average score and median salary (PLN/month), work-mode split, best offers of the week;
+- categories with average score and median salary (PLN/month), work-mode split, results per portal, best offers of the week;
 - up to 3 recommendations from Gemini (skill, why – citing the numbers, first step this week); skipped when fewer than 10 offers were scored.
 
 Gap names are merged case-insensitively. On report days the CSV is attached to the report instead of the daily digest.
@@ -63,4 +64,4 @@ python -m unittest -v           # offline tests (no network, no API key)
 ```
 
 ## Tech
-Python · requests · BeautifulSoup · Google Gemini API (structured output) · SQLite (encrypted at rest) · SMTP e-mail · GitHub Actions (cron, secrets, cache)
+Python · requests · BeautifulSoup · REST/JSON APIs · Google Gemini API (structured output) · SQLite (encrypted at rest) · SMTP e-mail · GitHub Actions (cron, secrets, cache)

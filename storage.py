@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS seen (                -- ids skipped without scoring 
 );
 """
 
+QUEUE_FIELDS = ("id", "source", "title", "company", "location", "url", "search_keyword",
+                "posted", "extra", "fingerprint")
+
 LIST_FIELDS = ("strengths", "gaps", "contract_types", "required_tools", "nice_to_have_tools")
 
 # Columns exported to CSV (description is left out - too long for a spreadsheet)
@@ -113,10 +116,13 @@ class Store:
         self.con.row_factory = sqlite3.Row
         self.con.executescript(SCHEMA_SQL)
         # columns added after the first release (CREATE TABLE IF NOT EXISTS doesn't add them to old files)
-        run_cols = {r[1] for r in self.con.execute("PRAGMA table_info(runs)")}
-        for col in ("queued", "queue_expired"):
-            if col not in run_cols:
-                self.con.execute(f"ALTER TABLE runs ADD COLUMN {col} INTEGER")
+        for table, cols in {"runs": {"queued": "INTEGER", "queue_expired": "INTEGER", "sources": "TEXT"},
+                            "offers": {"fingerprint": "TEXT"}}.items():
+            have = {r[1] for r in self.con.execute(f"PRAGMA table_info({table})")}
+            for col, typ in cols.items():
+                if col not in have:
+                    self.con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        self.con.execute("CREATE INDEX IF NOT EXISTS offers_fp ON offers(fingerprint)")
         self.con.commit()
 
     # ------------------------------------------------------------ seen ids
@@ -144,8 +150,7 @@ class Store:
     def enqueue(self, offers: list[dict]) -> None:
         self.con.executemany(
             "INSERT OR IGNORE INTO queue(id, offer, queued_at) VALUES (?, ?, ?)",
-            [(o["id"], json.dumps({k: o.get(k) for k in ("id", "title", "company", "location", "url",
-                                                           "search_keyword")}, ensure_ascii=False),
+            [(o["id"], json.dumps({k: o.get(k) for k in QUEUE_FIELDS}, ensure_ascii=False),
               now_iso()) for o in offers])
         self.con.commit()
 
@@ -177,12 +182,21 @@ class Store:
             self.mark_seen(i)
         return len(old)
 
+    def recent_fingerprints(self, days: int = 30) -> set[str]:
+        """company|title of offers scored recently or waiting in the queue - for cross-portal de-duplication."""
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).replace(microsecond=0).isoformat()
+        fps = {r[0] for r in self.con.execute(
+            "SELECT fingerprint FROM offers WHERE fingerprint IS NOT NULL AND first_seen >= ?", (cutoff,))}
+        fps |= {o.get("fingerprint") for o in self.queued() if o.get("fingerprint")}
+        return fps
+
     def queue_size(self) -> int:
         return self.con.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
 
     # ------------------------------------------------------------ offers
     def save_offer(self, row: dict, description: str = "") -> None:
-        data = {k: row.get(k) for k in EXPORT_COLUMNS if k in row}
+        data = {k: row.get(k) for k in EXPORT_COLUMNS + ["fingerprint"] if k in row}
         for f in LIST_FIELDS:
             if f in data and data[f] is not None:
                 data[f] = json.dumps(data[f], ensure_ascii=False)

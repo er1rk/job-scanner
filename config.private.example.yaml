@@ -8,6 +8,9 @@ keywords:
 locations:
   - "Your City, Country"
 
+include_title_keywords:      # optional: keep only titles containing one of these
+  - analyst
+
 exclude_title_keywords:
   - senior
   - intern

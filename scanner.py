@@ -1,8 +1,8 @@
 """
 AI Job Scanner
 --------------
-1. Pulls fresh job offers from LinkedIn's public job search (no login).
-2. Filters out obvious mismatches by title.
+1. Pulls fresh job offers from several portals (LinkedIn, pracuj.pl, No Fluff Jobs, justjoin.it - see sources/).
+2. Filters out obvious mismatches by title and drops the same job seen on another portal.
 3. Asks Google Gemini to score each offer against the candidate profile
    using a recruiter-style rubric (0-100) and to extract structured facts
    (salary, work mode, contract, required tools, English level...).
@@ -26,13 +26,13 @@ import time
 from datetime import date, datetime
 from email.message import EmailMessage
 from pathlib import Path
-from urllib.parse import quote_plus
 
 import requests
 import yaml
-from bs4 import BeautifulSoup
 
 import report
+import sources
+from sources import common
 from storage import Store, decrypt_file, encrypt_file, now_iso
 
 ROOT = Path(__file__).parent
@@ -41,19 +41,6 @@ DB_FILE = ROOT / "data" / "jobs.db"
 DB_ENC_FILE = ROOT / "data" / "jobs.db.enc"   # the only form that is cached in GitHub Actions
 CSV_FILE = ROOT / "data" / "jobs.csv"
 REPORT_FILE = ROOT / "data" / "report.html"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9,pl;q=0.8",
-}
-SEARCH_URL = (
-    "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-    "?keywords={kw}&location={loc}&f_TPR=r{secs}&start={start}"
-)
-DETAIL_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{id}"
-VIEW_URL = "https://www.linkedin.com/jobs/view/{id}/"
-
-
 # ---------------------------------------------------------------- helpers
 def load_config() -> dict:
     """Public defaults from config.yaml, overridden by a private config that never lands in the repo:
@@ -85,54 +72,6 @@ def load_profile() -> str:
     sys.exit("No candidate profile found (set CANDIDATE_PROFILE or create profile.md)")
 
 
-def get(url: str, retries: int = 3) -> str | None:
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=20)
-            if r.status_code == 200:
-                return r.text
-            if r.status_code == 429:  # rate limited - back off
-                time.sleep(10 * (attempt + 1))
-                continue
-            return None
-        except requests.RequestException:
-            time.sleep(5)
-    return None
-
-
-# ---------------------------------------------------------------- LinkedIn
-def parse_search(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    offers = []
-    for card in soup.select("div.base-card[data-entity-urn]"):
-        m = re.search(r"jobPosting:(\d+)", card["data-entity-urn"])
-        if not m:
-            continue
-        def txt(sel):
-            el = card.select_one(sel)
-            return el.get_text(" ", strip=True) if el else ""
-        offers.append({
-            "id": m.group(1),
-            "title": txt("h3.base-search-card__title"),
-            "company": txt("h4.base-search-card__subtitle"),
-            "location": txt("span.job-search-card__location"),
-            "url": VIEW_URL.format(id=m.group(1)),
-        })
-    return offers
-
-
-def parse_detail(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    desc = soup.select_one("div.show-more-less-html__markup")
-    text = desc.get_text("\n", strip=True) if desc else ""
-    criteria = [
-        f"{li.select_one('h3').get_text(strip=True)}: {li.select_one('span').get_text(strip=True)}"
-        for li in soup.select("li.description__job-criteria-item")
-        if li.select_one("h3") and li.select_one("span")
-    ]
-    return (text + "\n\n" + "\n".join(criteria)).strip()
-
-
 def build_searches(cfg: dict) -> list[dict]:
     """Every keyword x every location, plus remote-in-Poland, plus any explicit 'searches'."""
     searches = list(cfg.get("searches") or [])
@@ -144,38 +83,66 @@ def build_searches(cfg: dict) -> list[dict]:
     return searches
 
 
-def fetch_offers(cfg: dict, seen: set, stats: dict) -> list[dict]:
-    secs = int(cfg["posted_within_hours"]) * 3600
-    excluded = [w.lower() for w in cfg.get("exclude_title_keywords", [])]
-    found: dict[str, dict] = {}
-    cards_total, filtered = 0, set()
-    for s in build_searches(cfg):
-        for page in range(int(cfg.get("pages_per_search", 1))):
-            url = SEARCH_URL.format(kw=quote_plus(s["keywords"]), loc=quote_plus(s["location"]),
-                                    secs=secs, start=page * 25)
-            if s.get("remote"):
-                url += "&f_WT=2"  # LinkedIn filter: remote only
-            html = get(url)
-            if not html:
-                break
-            cards = parse_search(html)
-            cards_total += len(cards)
-            for o in cards:
-                if o["id"] in seen or o["id"] in found:
-                    continue
-                if any(w in o["title"].lower() for w in excluded):
-                    filtered.add(o["id"])
-                    continue
-                o["search_keyword"] = s["keywords"]
-                found[o["id"]] = o
-            time.sleep(2)
-            if len(cards) < 25:  # no more pages
-                break
-    stats.update(searches=len(build_searches(cfg)), cards_found=cards_total,
-                 filtered_title=len(filtered), new_offers=len(found))
-    print(f"Searches run: {stats['searches']}, cards: {cards_total}, "
-          f"dropped by title: {len(filtered)}, unique new offers: {len(found)}")
-    return list(found.values())  # the per-run cap is applied in main(), the rest goes to the queue
+def _title_ok(title: str, cfg: dict) -> bool:
+    t = common.strip_accents(title.lower())
+    if any(common.strip_accents(w.lower()) in t for w in cfg.get("exclude_title_keywords") or []):
+        return False
+    include = cfg.get("include_title_keywords") or []
+    return not include or any(common.strip_accents(w.lower()) in t for w in include)
+
+
+def round_robin(groups: list[list[dict]]) -> list[dict]:
+    """Interleave sources so the per-run cap is shared fairly instead of filled by the first portal."""
+    out, i = [], 0
+    while any(i < len(g) for g in groups):
+        out += [g[i] for g in groups if i < len(g)]
+        i += 1
+    return out
+
+
+def fetch_offers(cfg: dict, seen: set, seen_fps: set, stats: dict) -> list[dict]:
+    hours = int(cfg["posted_within_hours"])
+    searches = build_searches(cfg)
+    run_fps: set[str] = set()
+    groups, per_source, failed_sources = [], {}, []
+    for name in cfg.get("sources") or ["linkedin"]:
+        mod = sources.ALL.get(name)
+        if not mod:
+            print(f"Unknown source '{name}' - skipped")
+            continue
+        try:
+            found = mod.search(searches, cfg, hours)
+        except Exception as e:  # one broken portal must not stop the others
+            print(f"{name}: search failed ({type(e).__name__})")
+            failed_sources.append(name)
+            found = []
+        st = {"cards": len(found), "filtered": 0, "duplicates": 0, "new": 0}
+        new, ids = [], set()
+        for o in found:
+            o.setdefault("source", name)
+            o["fingerprint"] = common.fingerprint(o.get("company"), o.get("title"))
+            if o["id"] in seen or o["id"] in ids:
+                continue  # already known (or listed twice by this portal)
+            ids.add(o["id"])
+            if not _title_ok(o.get("title", ""), cfg):
+                st["filtered"] += 1
+                continue
+            if o["fingerprint"] in seen_fps or o["fingerprint"] in run_fps:
+                st["duplicates"] += 1  # same company + title already found on another portal
+                continue
+            run_fps.add(o["fingerprint"])
+            new.append(o)
+        st["new"] = len(new)
+        per_source[name] = st
+        groups.append(new)
+        print(f"  {name}: cards {st['cards']}, dropped by title {st['filtered']}, "
+              f"cross-portal duplicates {st['duplicates']}, new {st['new']}")
+    stats.update(searches=len(searches), cards_found=sum(v["cards"] for v in per_source.values()),
+                 filtered_title=sum(v["filtered"] for v in per_source.values()),
+                 new_offers=sum(v["new"] for v in per_source.values()),
+                 sources=json.dumps(per_source), failed_sources=failed_sources)
+    print(f"Searches: {len(searches)} per source, unique new offers: {stats['new_offers']}")
+    return round_robin(groups)  # the per-run cap is applied in main(), the rest goes to the queue
 
 
 # ---------------------------------------------------------------- Gemini
@@ -372,7 +339,7 @@ def build_email(results: list[dict], csv_text: str | None = None, warning: str =
           <td style="padding:10px;font-size:20px;font-weight:bold;vertical-align:top;color:{colour.get(r['verdict'], '#333')}">{r['score']}</td>
           <td style="padding:10px">
             <a href="{html.escape(r['url'])}" style="font-weight:bold;font-size:15px">{html.escape(r['title'])}</a><br>
-            <span style="color:#555">{html.escape(r['company'])} · {html.escape(r['location'])}</span><br>
+            <span style="color:#555">{html.escape(r['company'])} · {html.escape(r['location'])} · <i>{html.escape(sources.label(r.get('source')))}</i></span><br>
             {f'<span style="color:#333">{html.escape(facts)}</span><br>' if facts else ''}
             {f'<span style="color:#555">Tools: {html.escape(tools)}</span><br>' if tools else ''}
             <i>{html.escape(r['one_line_reason'])}</i><br>
@@ -507,7 +474,8 @@ def main() -> None:
 
     expired = store.expire_queue(int(cfg.get("queue_max_age_days", 7)))
     backlog = store.queued()  # offers left over from earlier runs go first
-    new = fetch_offers(cfg, set() if ignore_seen else store.seen_ids(), stats)
+    new = fetch_offers(cfg, set() if ignore_seen else store.seen_ids(),
+                       set() if ignore_seen else store.recent_fingerprints(), stats)
     backlog_ids = {o["id"] for o in backlog}
     candidates = backlog + [o for o in new if o["id"] not in backlog_ids]
     cap = int(cfg["max_offers_per_run"])
@@ -518,12 +486,15 @@ def main() -> None:
 
     results, failed = [], 0
     for i, o in enumerate(offers, 1):
-        page = get(DETAIL_URL.format(id=o["id"]))
-        if page is None:  # network problem / rate limit - try again next run
+        src = sources.ALL.get(o.get("source") or "linkedin", sources.linkedin)
+        try:
+            desc = src.detail(o)
+        except Exception:  # unexpected page format - treat like a temporary failure
+            desc = None
+        if desc is None:  # network problem / rate limit - try again next run
             store.queue_failed(o)
             failed += 1
             continue
-        desc = parse_detail(page)
         if not desc:  # offer removed or no description - nothing to score
             store.dequeue(o["id"])
             store.mark_seen(o["id"])
@@ -550,8 +521,12 @@ def main() -> None:
     # LinkedIn returning nothing at all almost always means the page layout changed or we got blocked
     warning = ""
     if stats.get("searches") and not stats.get("cards_found"):
-        warning = ("The scraper found 0 offers across all searches - LinkedIn may have changed its "
-                   "page layout or blocked the request. Check the latest Actions log.")
+        warning = ("The scraper found 0 offers across all sources - the portals may have changed their "
+                   "page layout or blocked the requests. Check the latest Actions log.")
+    elif stats.get("failed_sources"):
+        warning = (f"Searching {', '.join(map(sources.label, stats['failed_sources']))} failed - "
+                   f"its page format may have changed. The other sources worked.")
+    stats.pop("failed_sources", None)
 
     if args.dry_run:
         for r in good:

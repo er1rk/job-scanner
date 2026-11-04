@@ -10,11 +10,18 @@ locations:
 
 include_remote_poland: true
 
+# Portals to search (see sources/). Remove one to switch it off.
+sources: [linkedin, pracuj, nofluffjobs, justjoin]
+
 # Only offers posted in the last N hours
 posted_within_hours: 24
 
 # How many result pages (25 offers each) to read per search
 pages_per_search: 1
+
+# If not empty: keep only offers whose title contains at least one of these words (case- and
+# accent-insensitive). Useful for portals that match keywords loosely (e.g. pracuj.pl).
+include_title_keywords: []
 
 # Skip offers whose title contains any of these words (case-insensitive) before calling the AI
 exclude_title_keywords:
