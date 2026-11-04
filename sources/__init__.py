@@ -4,9 +4,9 @@ search  -> list of offers: {id, source, title, company, location, url, search_ke
 detail  -> description text; "" if the offer is gone; None on a network error (retried later)
 """
 
-from . import justjoin, linkedin, nofluffjobs, pracuj
+from . import justjoin, linkedin, nofluffjobs, pracuj, rocketjobs
 
-ALL = {m.NAME: m for m in (linkedin, pracuj, nofluffjobs, justjoin)}
+ALL = {m.NAME: m for m in (linkedin, pracuj, nofluffjobs, justjoin, rocketjobs)}
 
 
 def label(name: str | None) -> str:

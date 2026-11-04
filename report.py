@@ -275,7 +275,7 @@ def build_report_html(stats: dict, recs: dict | None = None, csv_attached: bool 
                f"of offers state a salary; gross and B2B rates are mixed. Work mode: {wm}.</div>")
 
     if len(stats.get("sources") or []) > 1:
-        labels = {"linkedin": "LinkedIn", "pracuj": "pracuj.pl", "nofluffjobs": "No Fluff Jobs", "justjoin": "justjoin.it"}
+        labels = {"linkedin": "LinkedIn", "pracuj": "pracuj.pl", "nofluffjobs": "No Fluff Jobs", "justjoin": "justjoin.it", "rocketjobs": "RocketJobs"}
         out.append(f"<h2 {h2}>Portals</h2><table style='border-collapse:collapse'>"
                    f"<tr><th {th}>portal</th><th {th}>offers</th><th {th}>avg score</th><th {th}>apply</th></tr>")
         for src in stats["sources"]:
