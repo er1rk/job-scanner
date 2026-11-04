@@ -187,3 +187,31 @@ class Store:
 
     def close(self) -> None:
         self.con.close()
+
+
+# ---------------------------------------------------------------- encryption at rest
+# The database is kept in the GitHub Actions cache. The repo is public, so it is stored there only
+# encrypted (Fernet = AES-128-CBC + HMAC-SHA256) with a key from the DB_ENCRYPTION_KEY secret.
+def _fernet(secret: str):
+    import base64
+    import hashlib
+
+    from cryptography.fernet import Fernet
+    try:  # a real Fernet key (from Fernet.generate_key())
+        return Fernet(secret.encode())
+    except ValueError:  # any long passphrase works too - derive a key from it
+        key = hashlib.scrypt(secret.encode(), salt=b"job-scanner-db", n=2 ** 14, r=8, p=1, dklen=32)
+        return Fernet(base64.urlsafe_b64encode(key))
+
+
+def encrypt_file(src: Path, dst: Path, secret: str) -> None:
+    dst.write_bytes(_fernet(secret).encrypt(src.read_bytes()))
+
+
+def decrypt_file(src: Path, dst: Path, secret: str) -> None:
+    from cryptography.fernet import InvalidToken
+    try:
+        dst.write_bytes(_fernet(secret).decrypt(src.read_bytes()))
+    except InvalidToken:
+        raise SystemExit("Could not decrypt the database - DB_ENCRYPTION_KEY is different from the one "
+                         "used to encrypt it. Restore the old key (or delete the Actions cache to start over).")

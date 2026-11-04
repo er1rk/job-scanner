@@ -3,3 +3,4 @@ data/
 .env
 __pycache__/
 .venv/
+config.private.yaml

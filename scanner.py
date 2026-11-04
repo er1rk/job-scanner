@@ -32,12 +32,15 @@ import requests
 import yaml
 from bs4 import BeautifulSoup
 
-from storage import Store, now_iso
+import report
+from storage import Store, decrypt_file, encrypt_file, now_iso
 
 ROOT = Path(__file__).parent
 SEEN_FILE = ROOT / "data" / "seen.json"   # legacy cache, migrated into the database on first run
 DB_FILE = ROOT / "data" / "jobs.db"
+DB_ENC_FILE = ROOT / "data" / "jobs.db.enc"   # the only form that is cached in GitHub Actions
 CSV_FILE = ROOT / "data" / "jobs.csv"
+REPORT_FILE = ROOT / "data" / "report.html"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -53,8 +56,21 @@ VIEW_URL = "https://www.linkedin.com/jobs/view/{id}/"
 
 # ---------------------------------------------------------------- helpers
 def load_config() -> dict:
+    """Public defaults from config.yaml, overridden by a private config that never lands in the repo:
+    the PRIVATE_CONFIG secret (YAML text) in GitHub Actions, or config.private.yaml locally (git-ignored).
+    Keys are replaced as a whole, e.g. a private `keywords` list replaces the public one."""
     with open(ROOT / "config.yaml", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
+    private = os.getenv("PRIVATE_CONFIG")
+    if not private and (ROOT / "config.private.yaml").exists():
+        private = (ROOT / "config.private.yaml").read_text(encoding="utf-8")
+    if private:
+        override = yaml.safe_load(private)
+        if not isinstance(override, dict):
+            sys.exit("PRIVATE_CONFIG must be YAML key: value pairs")
+        cfg.update(override)
+        print(f"Private config applied ({len(override)} keys)")  # key count only - logs are public
+    return cfg
 
 
 def load_profile() -> str:
@@ -174,12 +190,26 @@ required language they don't speak, far more years required). Do NOT penalise wo
 Never assume skills the profile does not state. Answer in English.
 
 Write each gap as a short, reusable skill/requirement name (e.g. "SQL", "SAP", "German C1",
-"3+ years in AML") so gaps can be counted across many offers.
+"3+ years experience") so gaps can be counted across many offers.
 
 Also extract facts from the offer itself (independent of the candidate). Use null when the offer
 does not state something - never guess salaries. Salary: copy the numbers as written, with their
 currency, period (hour/day/month/year) and whether they are gross, net or B2B net ("unknown" if unclear).
 required_tools / nice_to_have_tools: concrete tools and technologies only (Excel, Power BI, SQL, Python, SAP...)."""
+
+DEFAULT_ROLE_CATEGORIES = ["data/analytics", "finance", "operations", "engineering",
+                           "sales/marketing", "other"]
+
+
+def build_schema(cfg: dict) -> dict:
+    """Role categories come from the (private) config, so the public code doesn't reveal target roles."""
+    cats = [str(c) for c in (cfg.get("role_categories") or DEFAULT_ROLE_CATEGORIES)]
+    if "other" not in cats:
+        cats.append("other")
+    schema = json.loads(json.dumps(SCHEMA))
+    schema["properties"]["role_category"]["enum"] = cats
+    return schema
+
 
 SCHEMA = {
     "type": "OBJECT",
@@ -192,9 +222,7 @@ SCHEMA = {
         "gaps": {"type": "ARRAY", "items": {"type": "STRING"}},
         "one_line_reason": {"type": "STRING"},
         # --- facts about the offer
-        "role_category": {"type": "STRING", "enum": [
-            "data/BI analytics", "fraud/AML/KYC/compliance", "risk", "trust & safety/brand protection",
-            "business analysis", "finance/operations", "AI/data annotation", "other"]},
+        "role_category": {"type": "STRING", "enum": DEFAULT_ROLE_CATEGORIES},  # replaced by build_schema
         "industry": {"type": "STRING", "nullable": True},
         "work_mode": {"type": "STRING", "enum": ["remote", "hybrid", "on-site", "unknown"]},
         "contract_types": {"type": "ARRAY", "items": {"type": "STRING", "enum": [
@@ -261,18 +289,15 @@ def pick_available_model(api_key: str, exclude: str = "") -> str | None:
     return flash[0] if flash else None
 
 
-def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key: str) -> dict | None:
-    prompt = (
-        f"{RUBRIC}\n\n### Candidate profile\n{profile}\n\n### Job offer\n"
-        f"Title: {offer['title']}\nCompany: {offer['company']}\nLocation: {offer['location']}\n\n"
-        f"{description[:12000]}"
-    )
+def call_gemini(prompt: str, schema: dict, cfg: dict, api_key: str, temperature: float = 0.2) -> dict | None:
+    """One structured-output call with retries, rate-limit back-off and model fallback.
+    Returns the parsed JSON object, or None if every attempt failed."""
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.2,
+            "temperature": temperature,
             "responseMimeType": "application/json",
-            "responseSchema": SCHEMA,
+            "responseSchema": schema,
         },
     }
     for attempt in range(5):
@@ -309,14 +334,25 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
             return None
         try:
             text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            result = json.loads(text)
+            return json.loads(text)
         except (KeyError, IndexError, json.JSONDecodeError):
             return None
-        result["score"] = max(0, min(100, int(result.get("score") or 0)))
-        result["model"] = cfg["gemini_model"]
-        result.update(normalise_salary(result, cfg))
-        return result
     return None
+
+
+def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key: str) -> dict | None:
+    prompt = (
+        f"{RUBRIC}\n\n### Candidate profile\n{profile}\n\n### Job offer\n"
+        f"Title: {offer['title']}\nCompany: {offer['company']}\nLocation: {offer['location']}\n\n"
+        f"{description[:12000]}"
+    )
+    result = call_gemini(prompt, build_schema(cfg), cfg, api_key)
+    if not result:
+        return None
+    result["score"] = max(0, min(100, int(result.get("score") or 0)))
+    result["model"] = cfg["gemini_model"]
+    result.update(normalise_salary(result, cfg))
+    return result
 
 
 # ---------------------------------------------------------------- E-mail
@@ -357,27 +393,66 @@ def build_email(results: list[dict], csv_text: str | None = None, warning: str =
     return "<div style='font-family:Arial,sans-serif'>" + "".join(parts) + "</div>"
 
 
-def send_email(results: list[dict], csv_text: str | None = None, warning: str = "") -> None:
+def send_html(subject: str, body_html: str, csv_text: str | None = None) -> None:
     sender, password = os.getenv("EMAIL_ADDRESS"), os.getenv("EMAIL_APP_PASSWORD")
     if not (sender and password):
         print("E-mail not configured - skipping notification")
         return
-    to = os.getenv("EMAIL_TO") or sender
     msg = EmailMessage()
-    if results:
-        msg["Subject"] = f"Job scan {date.today():%d.%m}: {len(results)} offers, best {results[0]['score']}/100"
-    else:
-        msg["Subject"] = f"Job scan {date.today():%d.%m}: " + ("check the scraper" if warning else "data export")
-    msg["From"], msg["To"] = sender, to
+    msg["Subject"] = subject
+    msg["From"], msg["To"] = sender, os.getenv("EMAIL_TO") or sender
     msg.set_content("Open this e-mail in an HTML-capable client.")
-    msg.add_alternative(build_email(results, csv_text, warning), subtype="html")
+    msg.add_alternative(body_html, subtype="html")
     if csv_text:
         msg.add_attachment(csv_text.encode("utf-8"), maintype="text", subtype="csv",
                            filename=f"jobs_{date.today():%Y-%m-%d}.csv")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(sender, password)
         smtp.send_message(msg)
-    print("E-mail sent")
+    print(f"E-mail sent: {subject.split(':')[0]}")
+
+
+def send_email(results: list[dict], csv_text: str | None = None, warning: str = "") -> None:
+    if results:
+        subject = f"Job scan {date.today():%d.%m}: {len(results)} offers, best {results[0]['score']}/100"
+    else:
+        subject = f"Job scan {date.today():%d.%m}: " + ("check the scraper" if warning else "data export")
+    send_html(subject, build_email(results, csv_text, warning), csv_text)
+
+
+def send_weekly_report(store: Store, cfg: dict, profile: str | None, api_key: str | None,
+                       csv_text: str | None = None) -> dict:
+    """Compute the weekly stats, ask Gemini for recommendations, e-mail the report."""
+    stats = report.compute_stats(store, threshold=cfg["min_score_to_notify"])
+    recs = None
+    if api_key and profile:
+        recs = report.ai_recommendations(
+            stats, profile, lambda prompt, schema: call_gemini(prompt, schema, cfg, api_key, temperature=0.4))
+    body = report.build_report_html(stats, recs, csv_attached=bool(csv_text))
+    send_html(f"Weekly job market report {date.today():%d.%m}: {stats['offers']} offers, "
+              f"{stats['near_miss_offers']} near misses", body, csv_text)
+    return {"stats": stats, "recs": recs, "html": body}
+
+
+# ---------------------------------------------------------------- encrypted database
+def open_db() -> Store:
+    """Decrypt data/jobs.db.enc (if present) and open the database.
+    In GitHub Actions a key is mandatory, so an unencrypted database can never end up in the cache."""
+    key = os.getenv("DB_ENCRYPTION_KEY")
+    if os.getenv("GITHUB_ACTIONS") == "true" and not key:
+        sys.exit("Set the DB_ENCRYPTION_KEY secret - the database is only cached encrypted.")
+    if key and DB_ENC_FILE.exists():
+        decrypt_file(DB_ENC_FILE, DB_FILE, key)
+    return Store(DB_FILE)
+
+
+def close_db(store: Store) -> None:
+    """Close the database and, if a key is set, replace it with the encrypted copy."""
+    store.close()
+    key = os.getenv("DB_ENCRYPTION_KEY")
+    if key and DB_FILE.exists():
+        encrypt_file(DB_FILE, DB_ENC_FILE, key)
+        DB_FILE.unlink()
 
 
 # ---------------------------------------------------------------- main
@@ -385,14 +460,27 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="print results, don't notify or save state")
     ap.add_argument("--export", action="store_true", help="write data/jobs.csv from the database and exit")
+    ap.add_argument("--report", action="store_true",
+                    help="build the weekly report from the database into data/report.html and exit (no e-mail)")
     args = ap.parse_args()
 
     cfg = load_config()
     if args.export:
-        store = Store(DB_FILE)
+        store = open_db()
         CSV_FILE.write_text(store.export_csv(), encoding="utf-8")
         print(f"Exported {store.count()} offers to {CSV_FILE}")
-        store.close()
+        close_db(store)
+        return
+    if args.report:
+        store = open_db()
+        stats = report.compute_stats(store, threshold=cfg["min_score_to_notify"])
+        key = os.getenv("GEMINI_API_KEY")
+        recs = report.ai_recommendations(
+            stats, load_profile(), lambda p, sc: call_gemini(p, sc, cfg, key, temperature=0.4)) if key else None
+        REPORT_FILE.write_text(report.build_report_html(stats, recs), encoding="utf-8")
+        print(report.report_text(stats, recs))
+        print(f"Report written to {REPORT_FILE}")
+        close_db(store)
         return
 
     # Optional overrides for manual test runs (set from the "Run workflow" form)
@@ -402,11 +490,12 @@ def main() -> None:
         cfg["min_score_to_notify"] = int(os.getenv("MIN_SCORE"))
     ignore_seen = os.getenv("IGNORE_SEEN", "").lower() == "true"
     force_csv = os.getenv("ATTACH_CSV", "").lower() == "true"
+    force_report = os.getenv("SEND_REPORT", "").lower() == "true"
     profile = load_profile()
     api_key = os.getenv("GEMINI_API_KEY") or sys.exit("Set GEMINI_API_KEY")
 
     # dry runs use a throw-away in-memory database, so they never change saved state
-    store = Store(Path(":memory:") if args.dry_run else DB_FILE)
+    store = Store(Path(":memory:")) if args.dry_run else open_db()
     if not args.dry_run:
         migrated = store.import_legacy_seen(SEEN_FILE)
         if migrated:
@@ -457,15 +546,21 @@ def main() -> None:
         store.close()
         return
 
-    attach = force_csv or datetime.now().weekday() in (cfg.get("attach_csv_weekdays") or [])
+    weekday = datetime.now().weekday()
+    attach = force_csv or weekday in (cfg.get("attach_csv_weekdays") or [])
+    report_due = force_report or weekday in (cfg.get("report_weekdays") or [])
     csv_text = store.export_csv() if attach and store.count() else None
-    if good or csv_text or warning:
-        send_email(good, csv_text, warning)
+    # On report days the CSV travels with the weekly report instead of the daily digest
+    digest_csv = None if report_due else csv_text
+    if good or digest_csv or warning:
+        send_email(good, digest_csv, warning)
         store.mark_notified([r["id"] for r in good])
+    if report_due:
+        send_weekly_report(store, cfg, profile, api_key, csv_text)
 
     store.save_run({**stats, "finished_at": now_iso(), "scored": len(results), "failed": failed,
                     "notified": len(good), "model": cfg["gemini_model"]})
-    store.close()
+    close_db(store)
 
 
 if __name__ == "__main__":
