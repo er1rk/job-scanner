@@ -169,13 +169,28 @@ SCHEMA = {
 }
 
 
-def score_offer(offer: dict, description: str, profile: str, model: str, api_key: str) -> dict | None:
+def pick_available_model(api_key: str) -> str | None:
+    """If the configured model doesn't exist for this key, find a Flash model that does."""
+    r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                     params={"key": api_key, "pageSize": 200}, timeout=30)
+    if r.status_code != 200:
+        print(f"  Could not list models: {r.status_code} {r.text[:200]}", file=sys.stderr)
+        return None
+    names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+             if "generateContent" in m.get("supportedGenerationMethods", [])]
+    flash = [n for n in names if "flash" in n and not any(x in n for x in ("tts", "image", "live", "embedding"))]
+    # prefer stable over preview, newest first
+    flash.sort(key=lambda n: ("preview" in n or "exp" in n, [-int(x) for x in re.findall(r"\d+", n)[:2]]))
+    print(f"  Available Flash models: {', '.join(flash[:6]) or 'none'}")
+    return flash[0] if flash else None
+
+
+def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key: str) -> dict | None:
     prompt = (
         f"{RUBRIC}\n\n### Candidate profile\n{profile}\n\n### Job offer\n"
         f"Title: {offer['title']}\nCompany: {offer['company']}\nLocation: {offer['location']}\n\n"
         f"{description[:12000]}"
     )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -185,12 +200,21 @@ def score_offer(offer: dict, description: str, profile: str, model: str, api_key
         },
     }
     for attempt in range(3):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['gemini_model']}:generateContent"
         r = requests.post(url, params={"key": api_key}, json=body, timeout=60)
         if r.status_code == 429:  # free-tier rate limit
             time.sleep(30 * (attempt + 1))
             continue
+        if r.status_code == 404 and not cfg.get("_model_checked"):
+            cfg["_model_checked"] = True
+            print(f"  Model '{cfg['gemini_model']}' not available - looking for another one")
+            m = pick_available_model(api_key)
+            if m:
+                cfg["gemini_model"] = m
+                print(f"  Using model: {m}")
+                continue
         if r.status_code != 200:
-            print(f"  Gemini error {r.status_code}", file=sys.stderr)
+            print(f"  Gemini error {r.status_code}: {r.text[:200]}", file=sys.stderr)
             return None
         try:
             text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -251,11 +275,12 @@ def main() -> None:
     for i, o in enumerate(offers, 1):
         html = get(DETAIL_URL.format(id=o["id"]))
         desc = parse_detail(html) if html else ""
-        seen.add(o["id"])
         if not desc:
+            seen.add(o["id"])
             continue
-        s = score_offer(o, desc, profile, cfg["gemini_model"], api_key)
+        s = score_offer(o, desc, profile, cfg, api_key)
         if s:
+            seen.add(o["id"])  # only remember offers that were actually scored
             results.append({**o, **s})
             if args.dry_run:
                 print(f"[{i}/{len(offers)}] {s['score']:>3}  {o['title']} – {o['company']} ({o['location']})")
