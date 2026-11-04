@@ -175,7 +175,7 @@ def fetch_offers(cfg: dict, seen: set, stats: dict) -> list[dict]:
                  filtered_title=len(filtered), new_offers=len(found))
     print(f"Searches run: {stats['searches']}, cards: {cards_total}, "
           f"dropped by title: {len(filtered)}, unique new offers: {len(found)}")
-    return list(found.values())[: int(cfg["max_offers_per_run"])]
+    return list(found.values())  # the per-run cap is applied in main(), the rest goes to the queue
 
 
 # ---------------------------------------------------------------- Gemini
@@ -356,7 +356,7 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
 
 
 # ---------------------------------------------------------------- E-mail
-def build_email(results: list[dict], csv_text: str | None = None, warning: str = "") -> str:
+def build_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0) -> str:
     """HTML body of the digest (kept separate from sending so it can be previewed/tested)."""
     colour = {"apply": "#1a7f37", "stretch": "#b08800", "skip": "#cf222e"}
     rows = []
@@ -387,6 +387,9 @@ def build_email(results: list[dict], csv_text: str | None = None, warning: str =
                      f"<table style='border-collapse:collapse;font-family:Arial,sans-serif'>{''.join(rows)}</table>")
     else:
         parts.append("<p>No new offers above the threshold today.</p>")
+    if waiting:
+        parts.append(f"<p style='color:#555'>{waiting} more offers are waiting in the queue and will be "
+                     f"scored on the next run(s).</p>")
     if csv_text:
         parts.append("<p style='color:#555'>Attached: <b>jobs.csv</b> - every scored offer so far "
                      "(ready for Power BI / Excel).</p>")
@@ -412,12 +415,12 @@ def send_html(subject: str, body_html: str, csv_text: str | None = None) -> None
     print(f"E-mail sent: {subject.split(':')[0]}")
 
 
-def send_email(results: list[dict], csv_text: str | None = None, warning: str = "") -> None:
+def send_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0) -> None:
     if results:
         subject = f"Job scan {date.today():%d.%m}: {len(results)} offers, best {results[0]['score']}/100"
     else:
         subject = f"Job scan {date.today():%d.%m}: " + ("check the scraper" if warning else "data export")
-    send_html(subject, build_email(results, csv_text, warning), csv_text)
+    send_html(subject, build_email(results, csv_text, warning, waiting), csv_text)
 
 
 def send_weekly_report(store: Store, cfg: dict, profile: str | None, api_key: str | None,
@@ -502,31 +505,47 @@ def main() -> None:
             print(f"Migrated {migrated} ids from seen.json into the database")
     stats = {"started_at": now_iso()}
 
-    offers = fetch_offers(cfg, set() if ignore_seen else store.seen_ids(), stats)
-    print(f"New offers to score: {len(offers)}")
+    expired = store.expire_queue(int(cfg.get("queue_max_age_days", 7)))
+    backlog = store.queued()  # offers left over from earlier runs go first
+    new = fetch_offers(cfg, set() if ignore_seen else store.seen_ids(), stats)
+    backlog_ids = {o["id"] for o in backlog}
+    candidates = backlog + [o for o in new if o["id"] not in backlog_ids]
+    cap = int(cfg["max_offers_per_run"])
+    offers, overflow = candidates[:cap], candidates[cap:]
+    store.enqueue(overflow)  # nothing over the cap is lost - it is scored on the next run
+    print(f"From queue: {len(backlog)}, new: {len(new)}, scoring now: {len(offers)}, "
+          f"queued for next run: {len(overflow)}, expired from queue: {expired}")
 
     results, failed = [], 0
     for i, o in enumerate(offers, 1):
         page = get(DETAIL_URL.format(id=o["id"]))
-        desc = parse_detail(page) if page else ""
-        if not desc:
+        if page is None:  # network problem / rate limit - try again next run
+            store.queue_failed(o)
+            failed += 1
+            continue
+        desc = parse_detail(page)
+        if not desc:  # offer removed or no description - nothing to score
+            store.dequeue(o["id"])
             store.mark_seen(o["id"])
             continue
         s = score_offer(o, desc, profile, cfg, api_key)
         if s:
             row = {**o, **s, "first_seen": now_iso()}
             store.save_offer(row, desc)  # every scored offer is kept, not only the good ones
+            store.dequeue(o["id"])
             results.append(row)
             if args.dry_run:
                 print(f"[{i}/{len(offers)}] {s['score']:>3}  {o['title']} – {o['company']} ({o['location']})")
         else:
-            failed += 1  # not saved -> will be retried on the next run
+            store.queue_failed(o)  # retried on the next run, dropped after 3 failed attempts
+            failed += 1
         time.sleep(6)  # stay under the free-tier requests-per-minute limit
+    waiting = store.queue_size()
 
     good = sorted((r for r in results if r["score"] >= cfg["min_score_to_notify"]),
                   key=lambda r: r["score"], reverse=True)
     print(f"Scored: {len(results)}, failed: {failed}, above threshold: {len(good)}, "
-          f"in database: {store.count()}")  # counts only - logs may be public
+          f"in database: {store.count()}, waiting in queue: {waiting}")  # counts only - logs may be public
 
     # LinkedIn returning nothing at all almost always means the page layout changed or we got blocked
     warning = ""
@@ -553,13 +572,14 @@ def main() -> None:
     # On report days the CSV travels with the weekly report instead of the daily digest
     digest_csv = None if report_due else csv_text
     if good or digest_csv or warning:
-        send_email(good, digest_csv, warning)
+        send_email(good, digest_csv, warning, waiting)
         store.mark_notified([r["id"] for r in good])
     if report_due:
         send_weekly_report(store, cfg, profile, api_key, csv_text)
 
     store.save_run({**stats, "finished_at": now_iso(), "scored": len(results), "failed": failed,
-                    "notified": len(good), "model": cfg["gemini_model"]})
+                    "notified": len(good), "model": cfg["gemini_model"],
+                    "queued": waiting, "queue_expired": expired})
     close_db(store)
 
 

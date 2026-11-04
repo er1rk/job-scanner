@@ -77,6 +77,12 @@ CREATE TABLE IF NOT EXISTS runs (
     notified       INTEGER,
     model          TEXT
 );
+CREATE TABLE IF NOT EXISTS queue (               -- offers found but not scored yet (over the per-run cap, or failed)
+    id        TEXT PRIMARY KEY,
+    offer     TEXT NOT NULL,                     -- JSON: title, company, location, url, search_keyword
+    queued_at TEXT NOT NULL,
+    attempts  INTEGER NOT NULL DEFAULT 0         -- failed scoring attempts
+);
 CREATE TABLE IF NOT EXISTS seen (                -- ids skipped without scoring (e.g. empty description)
     id TEXT PRIMARY KEY
 );
@@ -106,12 +112,18 @@ class Store:
         self.con = sqlite3.connect(path)
         self.con.row_factory = sqlite3.Row
         self.con.executescript(SCHEMA_SQL)
+        # columns added after the first release (CREATE TABLE IF NOT EXISTS doesn't add them to old files)
+        run_cols = {r[1] for r in self.con.execute("PRAGMA table_info(runs)")}
+        for col in ("queued", "queue_expired"):
+            if col not in run_cols:
+                self.con.execute(f"ALTER TABLE runs ADD COLUMN {col} INTEGER")
         self.con.commit()
 
     # ------------------------------------------------------------ seen ids
     def seen_ids(self) -> set[str]:
         ids = {r[0] for r in self.con.execute("SELECT id FROM offers")}
         ids |= {r[0] for r in self.con.execute("SELECT id FROM seen")}
+        ids |= {r[0] for r in self.con.execute("SELECT id FROM queue")}  # handled from the queue, not as new
         return ids
 
     def mark_seen(self, offer_id: str) -> None:
@@ -127,6 +139,46 @@ class Store:
         self.con.commit()
         seen_file.rename(seen_file.with_suffix(".json.migrated"))
         return len(ids)
+
+    # ------------------------------------------------------------ queue
+    def enqueue(self, offers: list[dict]) -> None:
+        self.con.executemany(
+            "INSERT OR IGNORE INTO queue(id, offer, queued_at) VALUES (?, ?, ?)",
+            [(o["id"], json.dumps({k: o.get(k) for k in ("id", "title", "company", "location", "url",
+                                                           "search_keyword")}, ensure_ascii=False),
+              now_iso()) for o in offers])
+        self.con.commit()
+
+    def queued(self) -> list[dict]:
+        """Oldest first, so nothing waits forever."""
+        return [json.loads(r[0]) for r in self.con.execute("SELECT offer FROM queue ORDER BY queued_at, id")]
+
+    def dequeue(self, offer_id: str) -> None:
+        self.con.execute("DELETE FROM queue WHERE id = ?", (offer_id,))
+        self.con.commit()
+
+    def queue_failed(self, offer: dict, max_attempts: int = 3) -> None:
+        """Keep a failed offer for the next run; give up after max_attempts."""
+        self.enqueue([offer])
+        self.con.execute("UPDATE queue SET attempts = attempts + 1 WHERE id = ?", (offer["id"],))
+        r = self.con.execute("SELECT attempts FROM queue WHERE id = ?", (offer["id"],)).fetchone()
+        if r and r[0] >= max_attempts:
+            self.dequeue(offer["id"])
+            self.mark_seen(offer["id"])
+        self.con.commit()
+
+    def expire_queue(self, max_age_days: int) -> int:
+        """Drop offers that waited too long (they are probably closed by now)."""
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).replace(microsecond=0).isoformat()
+        old = [r[0] for r in self.con.execute("SELECT id FROM queue WHERE queued_at < ?", (cutoff,))]
+        for i in old:
+            self.dequeue(i)
+            self.mark_seen(i)
+        return len(old)
+
+    def queue_size(self) -> int:
+        return self.con.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
 
     # ------------------------------------------------------------ offers
     def save_offer(self, row: dict, description: str = "") -> None:

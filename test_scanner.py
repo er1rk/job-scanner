@@ -90,6 +90,22 @@ class StoreTests(unittest.TestCase):
         self.assertIn("Power BI | Excel", csv_text)
         self.assertIn("Żabka", csv_text)
 
+    def test_queue_expiry_and_old_database_upgrade(self):
+        self.store.enqueue([{"id": "q1", "title": "t"}])
+        self.store.con.execute("UPDATE queue SET queued_at = '2020-01-01T00:00:00+00:00'")
+        self.assertEqual(self.store.expire_queue(7), 1)
+        self.assertIn("q1", self.store.seen_ids())
+        # a database created before the queue existed gets the new run columns
+        path = Path(self.tmp.name) / "old.db"
+        import sqlite3
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE runs (run_id INTEGER PRIMARY KEY, started_at TEXT)")
+        con.commit(); con.close()
+        old = Store(path)
+        cols = {r[1] for r in old.con.execute("PRAGMA table_info(runs)")}
+        self.assertTrue({"queued", "queue_expired"} <= cols)
+        old.close()
+
     def test_legacy_seen_migration(self):
         f = Path(self.tmp.name) / "seen.json"
         f.write_text(json.dumps(["a", "b"]))
@@ -101,18 +117,19 @@ class StoreTests(unittest.TestCase):
 class EndToEndTests(unittest.TestCase):
     """Full run with LinkedIn, Gemini and SMTP faked."""
 
-    def run_main(self, tmp, argv, env):
+    def run_main(self, tmp, argv, env, search_html=SEARCH_HTML, detail=lambda url: DETAIL_HTML,
+                 gemini=fake_gemini, **cfg_overrides):
         cfg = scanner.load_config()
-        cfg.update(attach_csv_weekdays=[], report_weekdays=[])
+        cfg.update(attach_csv_weekdays=[], report_weekdays=[], **cfg_overrides)
 
         def fake_get(url, retries=3):
-            return DETAIL_HTML if "jobPosting/" in url else SEARCH_HTML
+            return detail(url) if "jobPosting/" in url else search_html
         with mock.patch.object(scanner, "DB_FILE", Path(tmp) / "jobs.db"), \
              mock.patch.object(scanner, "SEEN_FILE", Path(tmp) / "seen.json"), \
              mock.patch.object(scanner, "CSV_FILE", Path(tmp) / "jobs.csv"), \
              mock.patch.object(scanner, "DB_ENC_FILE", Path(tmp) / "jobs.db.enc"), \
              mock.patch.object(scanner, "get", side_effect=fake_get), \
-             mock.patch.object(scanner.requests, "post", side_effect=fake_gemini), \
+             mock.patch.object(scanner.requests, "post", side_effect=gemini), \
              mock.patch.object(scanner.time, "sleep"), \
              mock.patch.object(scanner, "load_config", return_value=cfg), \
              mock.patch.object(scanner, "send_weekly_report") as weekly, \
@@ -127,7 +144,8 @@ class EndToEndTests(unittest.TestCase):
     def test_full_run_saves_everything_and_dedupes(self):
         with tempfile.TemporaryDirectory() as tmp:
             send = self.run_main(tmp, [], {"ATTACH_CSV": "true"})
-            good, csv_text, warning = send.call_args.args
+            good, csv_text, warning, waiting = send.call_args.args
+            self.assertEqual(waiting, 0)
             self.assertEqual([r["id"] for r in good], ["111"])  # "Senior" offer dropped by title
             self.assertIn("8000", csv_text)
             self.assertEqual(warning, "")
@@ -150,6 +168,50 @@ class EndToEndTests(unittest.TestCase):
             send = self.run_main(tmp, [], {"ATTACH_CSV": "true", "SEND_REPORT": "true"})
             self.assertIsNone(send.call_args.args[1])           # digest without CSV
             self.assertIn("8000", self.weekly.call_args.args[4])  # report carries it
+
+    def test_overflow_is_queued_and_scored_first_next_run(self):
+        cards = "".join(f'''<div class="base-card" data-entity-urn="urn:li:jobPosting:{i}">
+            <h3 class="base-search-card__title">Analyst {i}</h3><h4 class="base-search-card__subtitle">C</h4>
+            <span class="job-search-card__location">L</span></div>''' for i in (1, 2, 3))
+        with tempfile.TemporaryDirectory() as tmp:
+            send = self.run_main(tmp, [], {}, search_html=cards, max_offers_per_run=1)
+            self.assertEqual([r["id"] for r in send.call_args.args[0]], ["1"])
+            self.assertEqual(send.call_args.args[3], 2)                  # 2 waiting, mentioned in the e-mail
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual([o["id"] for o in store.queued()], ["2", "3"])
+            store.close()
+            # next run: LinkedIn shows nothing new, the queue is worked off oldest first
+            send = self.run_main(tmp, [], {}, search_html="", max_offers_per_run=1)
+            self.assertEqual([r["id"] for r in send.call_args.args[0]], ["2"])
+            send = self.run_main(tmp, [], {}, search_html="", max_offers_per_run=5)
+            self.assertEqual([r["id"] for r in send.call_args.args[0]], ["3"])
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual((store.count(), store.queue_size()), (3, 0))
+            run = store.con.execute("SELECT queued FROM runs ORDER BY run_id").fetchall()
+            self.assertEqual([r[0] for r in run], [2, 1, 0])
+            store.close()
+
+    def test_failed_scoring_is_retried_then_dropped(self):
+        def broken_gemini(*a, **k):
+            return mock.Mock(status_code=400, text="bad request")
+        with tempfile.TemporaryDirectory() as tmp:
+            for attempt in range(3):
+                self.run_main(tmp, [], {}, gemini=broken_gemini)
+                store = Store(Path(tmp) / "jobs.db")
+                self.assertEqual(store.queue_size(), 0 if attempt == 2 else 1)
+                store.close()
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertIn("111", store.seen_ids())                     # given up, not retried forever
+            store.close()
+
+    def test_removed_offer_leaves_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, [], {}, detail=lambda url: None)          # network error -> queued
+            store = Store(Path(tmp) / "jobs.db"); self.assertEqual(store.queue_size(), 1); store.close()
+            self.run_main(tmp, [], {}, search_html="", detail=lambda url: "<html></html>")  # offer gone
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual((store.queue_size(), store.count()), (0, 0))
+            store.close()
 
     def test_encrypted_database_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
