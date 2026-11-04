@@ -10,6 +10,8 @@ from unittest import mock
 
 import report
 import scanner
+import sources
+from sources import common, justjoin, nofluffjobs, pracuj
 from storage import Store
 
 SEARCH_HTML = """
@@ -120,15 +122,16 @@ class EndToEndTests(unittest.TestCase):
     def run_main(self, tmp, argv, env, search_html=SEARCH_HTML, detail=lambda url: DETAIL_HTML,
                  gemini=fake_gemini, **cfg_overrides):
         cfg = scanner.load_config()
-        cfg.update(attach_csv_weekdays=[], report_weekdays=[], **cfg_overrides)
+        cfg.update(attach_csv_weekdays=[], report_weekdays=[], sources=["linkedin"])
+        cfg.update(cfg_overrides)
 
-        def fake_get(url, retries=3):
+        def fake_get(url, retries=3, **kwargs):
             return detail(url) if "jobPosting/" in url else search_html
         with mock.patch.object(scanner, "DB_FILE", Path(tmp) / "jobs.db"), \
              mock.patch.object(scanner, "SEEN_FILE", Path(tmp) / "seen.json"), \
              mock.patch.object(scanner, "CSV_FILE", Path(tmp) / "jobs.csv"), \
              mock.patch.object(scanner, "DB_ENC_FILE", Path(tmp) / "jobs.db.enc"), \
-             mock.patch.object(scanner, "get", side_effect=fake_get), \
+             mock.patch.object(common, "get", side_effect=fake_get), \
              mock.patch.object(scanner.requests, "post", side_effect=gemini), \
              mock.patch.object(scanner.time, "sleep"), \
              mock.patch.object(scanner, "load_config", return_value=cfg), \
@@ -345,3 +348,182 @@ class ReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- sources (formats recorded from the live sites)
+def next_page(data: dict) -> str:
+    return f'<html><script id="__NEXT_DATA__" type="application/json">{json.dumps(data)}</script></html>'
+
+
+PRACUJ_SEARCH = next_page({"props": {"pageProps": {"dehydratedState": {"queries": [
+    {"state": {"data": {"offersTotalCount": 2, "groupedOffers": [
+        {"jobTitle": "Data Analyst (k/m)", "companyName": "Acme Sp. z o.o.", "lastPublicated": "2099-01-01T08:00:00Z",
+         "salaryDisplayText": "9 000–12 000 zł brutto / mies.", "positionLevels": ["Specjalista (Mid)"],
+         "typesOfContract": ["umowa o pracę"], "workModes": ["praca hybrydowa"],
+         "offers": [{"partitionId": 555, "offerAbsoluteUri": "https://www.pracuj.pl/praca/x,oferta,555",
+                     "displayWorkplace": "Warszawa"}]},
+        {"jobTitle": "Old offer", "companyName": "B", "lastPublicated": "2001-01-01T08:00:00Z",
+         "offers": [{"partitionId": 556, "offerAbsoluteUri": "u", "displayWorkplace": "Warszawa"}]},
+    ]}}},
+    {"state": {"data": [{"code": "1", "name": "24h"}]}},
+]}}}})
+PRACUJ_DETAIL = next_page({"props": {"pageProps": {"dehydratedState": {"queries": [{"state": {"data": {
+    "attributes": {"employment": {"salaryText": "9000-12000 PLN"}},
+    "textSections": [{"plainText": "O projekcie, analiza danych"}, {"plainText": "Wymagania, Power BI, SQL"}]}}}]}}}})
+
+NFJ_SEARCH = {"totalPages": 1, "postings": [
+    {"id": "data-analyst-acme-warszawa", "title": "Data Analyst", "name": "ACME", "posted": 4070908800000,
+     "url": "data-analyst-acme-warszawa", "location": {"places": [{"city": "Warszawa"}]},
+     "salary": {"from": 10000, "to": 14000, "currency": "PLN", "type": "b2b"}, "seniority": ["Mid"]},
+    {"id": "old", "title": "Old", "name": "X", "posted": 978307200000, "location": {"places": []}},
+    {"id": "bumped", "title": "Bumped BI Analyst", "name": "Y", "posted": 978307200000, "renewed": 4070908800000,
+     "location": {"places": [{"city": "Warszawa"}]}},
+]}
+NFJ_DETAIL = {"basics": {"seniority": ["Mid"]},
+              "requirements": {"musts": [{"value": "SQL"}, {"value": "Power BI"}], "nices": [{"value": "Python"}],
+                               "languages": [{"code": "en", "type": "MUST"}], "description": "<ul><li>2 lata</li></ul>"},
+              "specs": {"dailyTasks": ["Raporty"]}, "details": {"description": "<p>Opis <b>firmy</b></p>"},
+              "essentials": {"originalSalary": {"types": {"b2b": {"period": "Month", "range": [10000, 14000]}}}}}
+
+JJ_SEARCH = {"data": [
+    {"slug": "acme-data-analyst-warszawa", "title": "Data Analyst", "companyName": "Acme", "city": "Warsaw",
+     "workplaceType": "hybrid", "experienceLevel": "mid", "publishedAt": "2099-01-01T08:00:00Z", "locations": [],
+     "requiredSkills": [{"name": "SQL"}], "employmentTypes": [{"from": 9000, "to": 12000, "currency": "pln",
+                                                             "currencySource": "original", "unit": "month", "type": "permanent", "gross": True}]},
+    {"slug": "remote-pl", "title": "BI Analyst", "companyName": "R", "city": "Gdansk", "workplaceType": "remote",
+     "publishedAt": "2099-01-01T07:00:00Z", "locations": []},
+    {"slug": "remote-abroad", "title": "BI Analyst", "companyName": "L", "city": "Lisbon", "workplaceType": "remote",
+     "publishedAt": "2099-01-01T06:00:00Z", "locations": []},
+    {"slug": "office-krakow", "title": "Analyst", "companyName": "K", "city": "Krakow", "workplaceType": "office",
+     "publishedAt": "2099-01-01T05:00:00Z", "locations": []},
+]}
+JJ_DETAIL = ('<script type="application/ld+json">{"@type": "JobPosting", "description": "<p>We need <b>SQL</b></p>"}'
+             '</script>')
+SEARCHES = [{"keywords": "data analyst", "location": "Warsaw, Poland"},
+            {"keywords": "data analyst", "location": "Poland", "remote": True}]
+
+
+class CommonTests(unittest.TestCase):
+    def test_fingerprint_matches_across_portals(self):
+        a = common.fingerprint("Acme Sp. z o.o.", "Data Analyst (k/m)")
+        self.assertEqual(a, common.fingerprint("ACME", "Data Analyst"))
+        self.assertEqual(common.fingerprint("Żabka Polska S.A.", "Analityk danych (m/k)"),
+                         common.fingerprint("Zabka", "Analityk Danych"))
+        self.assertNotEqual(a, common.fingerprint("Acme", "Senior Data Analyst"))
+
+    def test_cities(self):
+        self.assertEqual(common.polish_city("Warsaw, Poland"), "Warszawa")
+        self.assertEqual(common.slug(common.polish_city("Łódź, Poland")), "lodz")
+        self.assertEqual(common.city_key("Warsaw"), common.city_key("Warszawa"))
+        self.assertEqual(common.city_key("Poznan"), common.city_key("Poznań, Poland"))
+
+    def test_round_robin(self):
+        self.assertEqual(scanner.round_robin([[1, 2, 3], ["a"], ["x", "y"]]), [1, "a", "x", 2, "y", 3])
+
+
+class SourceParsingTests(unittest.TestCase):
+    def test_pracuj(self):
+        with mock.patch.object(common, "get", side_effect=lambda u, **k: PRACUJ_DETAIL if "oferta" in u else PRACUJ_SEARCH), \
+             mock.patch("time.sleep"):
+            offers = pracuj.search(SEARCHES[:1], {"pages_per_search": 1}, 24)
+            self.assertEqual([o["id"] for o in offers], ["pracuj:555"])  # old one filtered by date
+            o = offers[0]
+            self.assertEqual((o["company"], o["location"], o["source"]), ("Acme Sp. z o.o.", "Warszawa", "pracuj"))
+            text = pracuj.detail(o)
+        self.assertIn("9 000–12 000 zł", text)
+        self.assertIn("Salary: 9000-12000 PLN", text)
+        self.assertIn("Wymagania, Power BI", text)
+        self.assertEqual(pracuj._period(24), 1)
+        self.assertEqual(pracuj._period(72), 3)
+
+    def test_pracuj_urls(self):
+        urls = []
+        with mock.patch.object(common, "get", side_effect=lambda u, **k: urls.append(u) or PRACUJ_SEARCH), \
+             mock.patch("time.sleep"):
+            pracuj.search(SEARCHES, {"pages_per_search": 1}, 24)
+        self.assertIn("/praca/data%20analyst;kw/warszawa;wp?rd=0&p=1", urls[0])
+        self.assertTrue(urls[1].endswith("data%20analyst;kw?rd=0&p=1&wm=home-office"))
+
+    def test_nofluffjobs(self):
+        bodies = []
+        def fake_post(url, payload, content_type=None):
+            bodies.append(payload["rawSearch"])
+            return NFJ_SEARCH
+        with mock.patch.object(common, "post_json", side_effect=fake_post), \
+             mock.patch.object(common, "get_json", return_value=NFJ_DETAIL), mock.patch("time.sleep"):
+            offers = nofluffjobs.search(SEARCHES, {"pages_per_search": 1}, 24)
+            text = nofluffjobs.detail(offers[0])
+        self.assertEqual(bodies, ["keyword='data analyst' city=warszawa", "keyword='data analyst' city=remote"])
+        self.assertEqual({o["id"] for o in offers}, {"nfj:data-analyst-acme-warszawa", "nfj:bumped"})
+        self.assertEqual(offers[0]["url"], "https://nofluffjobs.com/pl/job/data-analyst-acme-warszawa")
+        for part in ("Must have: SQL, Power BI", "Nice to have: Python", "en (MUST)", "- Raporty", "Opis firmy",
+                     "b2b: [10000, 14000] per Month", "10000-14000 PLN (b2b)"):
+            self.assertIn(part, text)
+
+    def test_justjoin_location_filter_and_detail(self):
+        with mock.patch.object(common, "get_json", return_value=JJ_SEARCH), \
+             mock.patch.object(common, "get", return_value=JJ_DETAIL), mock.patch("time.sleep"):
+            offers = justjoin.search(SEARCHES, {"pages_per_search": 1}, 24)
+            ids = [o["id"] for o in offers]
+            # Warsaw kept, remote in Poland kept, remote abroad and office in another city dropped
+            self.assertEqual(ids, ["jj:acme-data-analyst-warszawa", "jj:remote-pl"])
+            self.assertNotIn("_cities", offers[0])
+            text = justjoin.detail(offers[0])
+        self.assertIn("We need SQL", text)
+        self.assertIn("9000-12000 PLN /month permanent gross", text)
+        self.assertIn("Required skills: SQL", text)
+
+    def test_justjoin_without_remote(self):
+        with mock.patch.object(common, "get_json", return_value=JJ_SEARCH), mock.patch("time.sleep"):
+            offers = justjoin.search(SEARCHES[:1], {"pages_per_search": 1}, 24)
+        self.assertEqual([o["id"] for o in offers], ["jj:acme-data-analyst-warszawa"])
+
+
+class MultiSourceRunTests(unittest.TestCase):
+    run_main = EndToEndTests.run_main
+
+    def test_cross_portal_duplicate_scored_once_and_title_filter(self):
+        linkedin_card = """<div class="base-card" data-entity-urn="urn:li:jobPosting:777">
+          <h3 class="base-search-card__title">Data Analyst</h3><h4 class="base-search-card__subtitle">ACME</h4>
+          <span class="job-search-card__location">Warsaw</span></div>
+          <div class="base-card" data-entity-urn="urn:li:jobPosting:778">
+          <h3 class="base-search-card__title">Office Assistant</h3><h4 class="base-search-card__subtitle">Z</h4>
+          <span class="job-search-card__location">Warsaw</span></div>"""
+        def detail(url):
+            return PRACUJ_DETAIL if "oferta" in url else DETAIL_HTML
+        def search_get(url, retries=3, **kw):
+            if "jobPosting/" in url or "oferta" in url:
+                return detail(url)
+            return PRACUJ_SEARCH if "pracuj" in url else linkedin_card
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(common, "get", side_effect=search_get):
+            cfg = scanner.load_config()
+            cfg.update(attach_csv_weekdays=[], report_weekdays=[], sources=["linkedin", "pracuj"],
+                       include_title_keywords=["analyst", "analityk"], keywords=["data analyst"],
+                       locations=["Warsaw, Poland"], include_remote_poland=False)
+            with mock.patch.object(scanner, "DB_FILE", Path(tmp) / "jobs.db"), \
+                 mock.patch.object(scanner, "SEEN_FILE", Path(tmp) / "seen.json"), \
+                 mock.patch.object(scanner, "DB_ENC_FILE", Path(tmp) / "jobs.db.enc"), \
+                 mock.patch.object(scanner.requests, "post", side_effect=fake_gemini), \
+                 mock.patch("time.sleep"), mock.patch.object(scanner, "load_config", return_value=cfg), \
+                 mock.patch.object(scanner, "send_weekly_report"), \
+                 mock.patch.object(scanner, "send_email") as send, \
+                 mock.patch.object(sys, "argv", ["scanner.py"]), \
+                 mock.patch.dict(os.environ, {"GEMINI_API_KEY": "x", "CANDIDATE_PROFILE": "p",
+                                              "GITHUB_ACTIONS": "", "DB_ENCRYPTION_KEY": ""}):
+                scanner.main()
+            scored = send.call_args.args[0]
+            self.assertEqual([r["id"] for r in scored], ["777"])  # pracuj copy of ACME Data Analyst dropped
+            store = Store(Path(tmp) / "jobs.db")
+            per = json.loads(store.con.execute("SELECT sources FROM runs").fetchone()[0])
+            store.close()
+            self.assertEqual(per["linkedin"]["filtered"], 1)        # "Office Assistant" fails include filter
+            self.assertEqual(per["pracuj"]["duplicates"], 1)
+            self.assertIn("LinkedIn", scanner.build_email(scored))
+
+    def test_broken_source_does_not_stop_others(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(sources.pracuj, "search", side_effect=KeyError("layout changed")):
+            send = self.run_main(tmp, [], {}, sources=["pracuj", "linkedin"])
+            good, _, warning, _ = send.call_args.args
+            self.assertEqual([r["id"] for r in good], ["111"])
+            self.assertIn("pracuj.pl", warning)

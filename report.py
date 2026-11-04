@@ -134,6 +134,13 @@ def compute_stats(store, threshold: int, days: int = 7, now: datetime | None = N
             "median_max": round(statistics.median(highs)) if highs else None,
         })
 
+    by_src: dict[str, list[dict]] = defaultdict(list)
+    for r in week:
+        by_src[r.get("source") or "linkedin"].append(r)
+    portals = [{"source": src, "count": len(rs), "avg_score": round(statistics.mean(r["score"] or 0 for r in rs)),
+                "apply": sum(r["verdict"] == "apply" for r in rs)}
+               for src, rs in sorted(by_src.items(), key=lambda kv: -len(kv[1]))]
+
     verdicts = Counter(r["verdict"] for r in week)
     return {
         "period_start": start.date().isoformat(), "period_end": now.date().isoformat(),
@@ -150,6 +157,7 @@ def compute_stats(store, threshold: int, days: int = 7, now: datetime | None = N
         "near_miss_gaps": near_gaps,
         "top_required_tools": tools,
         "categories": categories,
+        "sources": portals,
         "best_offers": [{"title": r["title"], "company": r["company"], "score": r["score"], "url": r["url"]}
                         for r in sorted(week, key=lambda r: -(r["score"] or 0))[:5]],
     }
@@ -265,6 +273,15 @@ def build_report_html(stats: dict, recs: dict | None = None, csv_attached: bool 
     wm = " · ".join(f"{e(k)} {_pct(c, stats['offers'])}%" for k, c in stats["work_mode"].items())
     out.append(f"<div style='color:#57606a;font-size:12px;margin-top:6px'>* only {stats['offers_with_salary_pct']}% "
                f"of offers state a salary; gross and B2B rates are mixed. Work mode: {wm}.</div>")
+
+    if len(stats.get("sources") or []) > 1:
+        labels = {"linkedin": "LinkedIn", "pracuj": "pracuj.pl", "nofluffjobs": "No Fluff Jobs", "justjoin": "justjoin.it"}
+        out.append(f"<h2 {h2}>Portals</h2><table style='border-collapse:collapse'>"
+                   f"<tr><th {th}>portal</th><th {th}>offers</th><th {th}>avg score</th><th {th}>apply</th></tr>")
+        for src in stats["sources"]:
+            out.append(f"<tr><td {td}>{e(labels.get(src['source'], src['source']))}</td><td {td}>{src['count']}</td>"
+                       f"<td {td}>{src['avg_score']}</td><td {td}>{src['apply']}</td></tr>")
+        out.append("</table>")
 
     out.append(f"<h2 {h2}>Best offers this week</h2><ol style='padding-left:20px;margin:0'>")
     for o in stats["best_offers"]:
