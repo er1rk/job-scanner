@@ -4,11 +4,22 @@ on:
   schedule:
     - cron: "0 7 * * 1-5"   # Mon–Fri 07:00 UTC (08:00 Warsaw in winter, 09:00 in summer)
   workflow_dispatch:         # "Run workflow" button for manual runs
+    inputs:
+      hours:
+        description: "Offers posted within the last N hours (72 = 3 days)"
+        default: "24"
+      min_score:
+        description: "Minimum score to include in the e-mail"
+        default: "60"
+      ignore_seen:
+        description: "Re-score offers already seen before"
+        type: boolean
+        default: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -19,7 +30,6 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # Remember which offers were already scored (kept in cache, not committed)
       - uses: actions/cache@v4
         with:
           path: data/seen.json
@@ -32,4 +42,7 @@ jobs:
           CANDIDATE_PROFILE: ${{ secrets.CANDIDATE_PROFILE }}
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          HOURS: ${{ inputs.hours }}
+          MIN_SCORE: ${{ inputs.min_score }}
+          IGNORE_SEEN: ${{ inputs.ignore_seen }}
         run: python scanner.py
