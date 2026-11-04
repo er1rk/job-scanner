@@ -264,11 +264,17 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = load_config()
+    # Optional overrides for manual test runs (set from the "Run workflow" form)
+    if os.getenv("HOURS"):
+        cfg["posted_within_hours"] = int(os.getenv("HOURS"))
+    if os.getenv("MIN_SCORE"):
+        cfg["min_score_to_notify"] = int(os.getenv("MIN_SCORE"))
+    ignore_seen = os.getenv("IGNORE_SEEN", "").lower() == "true"
     profile = load_profile()
     api_key = os.getenv("GEMINI_API_KEY") or sys.exit("Set GEMINI_API_KEY")
     seen = load_seen()
 
-    offers = fetch_offers(cfg, seen)
+    offers = fetch_offers(cfg, set() if ignore_seen else seen)
     print(f"New offers to score: {len(offers)}")
 
     results = []
