@@ -32,12 +32,14 @@ import requests
 import yaml
 from bs4 import BeautifulSoup
 
+import report
 from storage import Store, now_iso
 
 ROOT = Path(__file__).parent
 SEEN_FILE = ROOT / "data" / "seen.json"   # legacy cache, migrated into the database on first run
 DB_FILE = ROOT / "data" / "jobs.db"
 CSV_FILE = ROOT / "data" / "jobs.csv"
+REPORT_FILE = ROOT / "data" / "report.html"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -261,18 +263,15 @@ def pick_available_model(api_key: str, exclude: str = "") -> str | None:
     return flash[0] if flash else None
 
 
-def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key: str) -> dict | None:
-    prompt = (
-        f"{RUBRIC}\n\n### Candidate profile\n{profile}\n\n### Job offer\n"
-        f"Title: {offer['title']}\nCompany: {offer['company']}\nLocation: {offer['location']}\n\n"
-        f"{description[:12000]}"
-    )
+def call_gemini(prompt: str, schema: dict, cfg: dict, api_key: str, temperature: float = 0.2) -> dict | None:
+    """One structured-output call with retries, rate-limit back-off and model fallback.
+    Returns the parsed JSON object, or None if every attempt failed."""
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.2,
+            "temperature": temperature,
             "responseMimeType": "application/json",
-            "responseSchema": SCHEMA,
+            "responseSchema": schema,
         },
     }
     for attempt in range(5):
@@ -309,14 +308,25 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
             return None
         try:
             text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            result = json.loads(text)
+            return json.loads(text)
         except (KeyError, IndexError, json.JSONDecodeError):
             return None
-        result["score"] = max(0, min(100, int(result.get("score") or 0)))
-        result["model"] = cfg["gemini_model"]
-        result.update(normalise_salary(result, cfg))
-        return result
     return None
+
+
+def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key: str) -> dict | None:
+    prompt = (
+        f"{RUBRIC}\n\n### Candidate profile\n{profile}\n\n### Job offer\n"
+        f"Title: {offer['title']}\nCompany: {offer['company']}\nLocation: {offer['location']}\n\n"
+        f"{description[:12000]}"
+    )
+    result = call_gemini(prompt, SCHEMA, cfg, api_key)
+    if not result:
+        return None
+    result["score"] = max(0, min(100, int(result.get("score") or 0)))
+    result["model"] = cfg["gemini_model"]
+    result.update(normalise_salary(result, cfg))
+    return result
 
 
 # ---------------------------------------------------------------- E-mail
@@ -357,27 +367,45 @@ def build_email(results: list[dict], csv_text: str | None = None, warning: str =
     return "<div style='font-family:Arial,sans-serif'>" + "".join(parts) + "</div>"
 
 
-def send_email(results: list[dict], csv_text: str | None = None, warning: str = "") -> None:
+def send_html(subject: str, body_html: str, csv_text: str | None = None) -> None:
     sender, password = os.getenv("EMAIL_ADDRESS"), os.getenv("EMAIL_APP_PASSWORD")
     if not (sender and password):
         print("E-mail not configured - skipping notification")
         return
-    to = os.getenv("EMAIL_TO") or sender
     msg = EmailMessage()
-    if results:
-        msg["Subject"] = f"Job scan {date.today():%d.%m}: {len(results)} offers, best {results[0]['score']}/100"
-    else:
-        msg["Subject"] = f"Job scan {date.today():%d.%m}: " + ("check the scraper" if warning else "data export")
-    msg["From"], msg["To"] = sender, to
+    msg["Subject"] = subject
+    msg["From"], msg["To"] = sender, os.getenv("EMAIL_TO") or sender
     msg.set_content("Open this e-mail in an HTML-capable client.")
-    msg.add_alternative(build_email(results, csv_text, warning), subtype="html")
+    msg.add_alternative(body_html, subtype="html")
     if csv_text:
         msg.add_attachment(csv_text.encode("utf-8"), maintype="text", subtype="csv",
                            filename=f"jobs_{date.today():%Y-%m-%d}.csv")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(sender, password)
         smtp.send_message(msg)
-    print("E-mail sent")
+    print(f"E-mail sent: {subject.split(':')[0]}")
+
+
+def send_email(results: list[dict], csv_text: str | None = None, warning: str = "") -> None:
+    if results:
+        subject = f"Job scan {date.today():%d.%m}: {len(results)} offers, best {results[0]['score']}/100"
+    else:
+        subject = f"Job scan {date.today():%d.%m}: " + ("check the scraper" if warning else "data export")
+    send_html(subject, build_email(results, csv_text, warning), csv_text)
+
+
+def send_weekly_report(store: Store, cfg: dict, profile: str | None, api_key: str | None,
+                       csv_text: str | None = None) -> dict:
+    """Compute the weekly stats, ask Gemini for recommendations, e-mail the report."""
+    stats = report.compute_stats(store, threshold=cfg["min_score_to_notify"])
+    recs = None
+    if api_key and profile:
+        recs = report.ai_recommendations(
+            stats, profile, lambda prompt, schema: call_gemini(prompt, schema, cfg, api_key, temperature=0.4))
+    body = report.build_report_html(stats, recs, csv_attached=bool(csv_text))
+    send_html(f"Weekly job market report {date.today():%d.%m}: {stats['offers']} offers, "
+              f"{stats['near_miss_offers']} near misses", body, csv_text)
+    return {"stats": stats, "recs": recs, "html": body}
 
 
 # ---------------------------------------------------------------- main
@@ -385,6 +413,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="print results, don't notify or save state")
     ap.add_argument("--export", action="store_true", help="write data/jobs.csv from the database and exit")
+    ap.add_argument("--report", action="store_true",
+                    help="build the weekly report from the database into data/report.html and exit (no e-mail)")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -392,6 +422,17 @@ def main() -> None:
         store = Store(DB_FILE)
         CSV_FILE.write_text(store.export_csv(), encoding="utf-8")
         print(f"Exported {store.count()} offers to {CSV_FILE}")
+        store.close()
+        return
+    if args.report:
+        store = Store(DB_FILE)
+        stats = report.compute_stats(store, threshold=cfg["min_score_to_notify"])
+        key = os.getenv("GEMINI_API_KEY")
+        recs = report.ai_recommendations(
+            stats, load_profile(), lambda p, sc: call_gemini(p, sc, cfg, key, temperature=0.4)) if key else None
+        REPORT_FILE.write_text(report.build_report_html(stats, recs), encoding="utf-8")
+        print(report.report_text(stats, recs))
+        print(f"Report written to {REPORT_FILE}")
         store.close()
         return
 
@@ -402,6 +443,7 @@ def main() -> None:
         cfg["min_score_to_notify"] = int(os.getenv("MIN_SCORE"))
     ignore_seen = os.getenv("IGNORE_SEEN", "").lower() == "true"
     force_csv = os.getenv("ATTACH_CSV", "").lower() == "true"
+    force_report = os.getenv("SEND_REPORT", "").lower() == "true"
     profile = load_profile()
     api_key = os.getenv("GEMINI_API_KEY") or sys.exit("Set GEMINI_API_KEY")
 
@@ -457,11 +499,17 @@ def main() -> None:
         store.close()
         return
 
-    attach = force_csv or datetime.now().weekday() in (cfg.get("attach_csv_weekdays") or [])
+    weekday = datetime.now().weekday()
+    attach = force_csv or weekday in (cfg.get("attach_csv_weekdays") or [])
+    report_due = force_report or weekday in (cfg.get("report_weekdays") or [])
     csv_text = store.export_csv() if attach and store.count() else None
-    if good or csv_text or warning:
-        send_email(good, csv_text, warning)
+    # On report days the CSV travels with the weekly report instead of the daily digest
+    digest_csv = None if report_due else csv_text
+    if good or digest_csv or warning:
+        send_email(good, digest_csv, warning)
         store.mark_notified([r["id"] for r in good])
+    if report_due:
+        send_weekly_report(store, cfg, profile, api_key, csv_text)
 
     store.save_run({**stats, "finished_at": now_iso(), "scored": len(results), "failed": failed,
                     "notified": len(good), "model": cfg["gemini_model"]})

@@ -19,6 +19,10 @@ on:
         description: "Attach the full dataset (jobs.csv) to the e-mail"
         type: boolean
         default: false
+      send_report:
+        description: "Also send the weekly market & skill-gap report"
+        type: boolean
+        default: false
 
 jobs:
   scan:
@@ -63,4 +67,5 @@ jobs:
           MIN_SCORE: ${{ inputs.min_score }}
           IGNORE_SEEN: ${{ inputs.ignore_seen }}
           ATTACH_CSV: ${{ inputs.attach_csv }}
+          SEND_REPORT: ${{ inputs.send_report }}
         run: python scanner.py

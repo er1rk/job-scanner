@@ -66,3 +66,7 @@ fx_to_pln:
 
 # Attach the full dataset (jobs.csv) to the e-mail on these weekdays (0 = Monday ... 6 = Sunday)
 attach_csv_weekdays: [0]
+
+# Send the weekly market & skill-gap report on these weekdays (0 = Monday). It covers the last 7 days
+# and carries the CSV attachment on that day.
+report_weekdays: [0]
