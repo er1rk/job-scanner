@@ -10,14 +10,15 @@ A small automation that finds fresh job offers and scores them against my profil
    The same job is often listed on several portals; offers with the same normalised company + title (legal forms like *Sp. z o.o.* and gender tags like *(k/m)* removed) are scored only once. When the per-run cap is reached, portals share it round-robin.
 2. Obvious mismatches (e.g. *senior*, *internship*) are dropped by title before any AI call, saving tokens. Optionally `include_title_keywords` keeps only titles containing one of the given words – useful because some portals match keywords loosely.
    At most `max_offers_per_run` offers are scored per run; the rest go to a **queue** in the database and are scored first on the next run (queued offers older than `queue_max_age_days` are dropped, failed ones are retried up to 3 times). The digest says how many offers are still waiting.
-3. Each remaining offer is sent to Gemini in **one call** that returns a JSON object enforced by a schema:
+3. **AI pre-filter (triage):** new offers are sent to Gemini in batches of 60 titles (title, company, location, portal – one call per batch). Clear mismatches – a different profession, seniority far above the candidate, a language in the title they don't speak – are dropped before the expensive per-offer scoring; when unsure the model keeps the offer, and if a call fails the whole batch is kept. Dropped offers are stored and listed in the weekly report so the filter can be checked.
+4. Each remaining offer is sent to Gemini in **one call** that returns a JSON object enforced by a schema:
    - **fit** – score from a recruiter-style rubric (mandatory requirements 40, experience 20, education 15, languages 10, nice-to-haves 15), verdict, strengths, gaps (as short reusable skill names), one-line reason;
    - **facts about the offer** – role category, industry, work mode, contract types, salary range (currency, period, gross/net), years required, English level, whether Polish is required, required and nice-to-have tools.
-4. Salaries are normalised to **PLN per month** (`fx_to_pln` in `config.yaml`), so offers can be compared.
-5. **Every** scored offer – not only the good ones – is saved to `data/jobs.db` (SQLite), together with a compressed copy of the description for later re-scoring/evaluation. Each run is logged too (searches, offers found, filtered, scored, failed).
-6. Offers above the threshold are e-mailed as an HTML digest, best first. On Mondays (configurable) the full dataset is attached as `jobs.csv`.
-7. Once a week (Monday by default) a **market & skill-gap report** is e-mailed – see below.
-8. If LinkedIn returns 0 offers across all searches, the e-mail carries a warning – that usually means the page layout changed or the request was blocked, not that there are no jobs.
+5. Salaries are normalised to **PLN per month** (`fx_to_pln` in `config.yaml`), so offers can be compared.
+6. **Every** scored offer – not only the good ones – is saved to `data/jobs.db` (SQLite), together with a compressed copy of the description for later re-scoring/evaluation. Each run is logged too (searches, offers found, filtered, scored, failed).
+7. Offers above the threshold are e-mailed as an HTML digest, best first. On Mondays (configurable) the full dataset is attached as `jobs.csv`.
+8. Once a week (Monday by default) a **market & skill-gap report** is e-mailed – see below.
+9. If the portals return 0 offers across all searches, the e-mail carries a warning – that usually means the page layout changed or the request was blocked, not that there are no jobs.
 
 ## Weekly market & skill-gap report
 All numbers are computed in Python straight from the database; the LLM only receives the aggregates and turns them into at most three learning recommendations, so it cannot invent counts.
@@ -27,6 +28,7 @@ All numbers are computed in Python straight from the database; the LLM only rece
 - most common gaps overall with the week-over-week trend;
 - most required tools, and in how many of those offers the tool was the candidate's gap;
 - categories with average score and median salary (PLN/month), work-mode split, results per portal, best offers of the week;
+- offers skipped by the AI pre-filter (count and the latest titles);
 - up to 3 recommendations from Gemini (skill, why – citing the numbers, first step this week); skipped when fewer than 10 offers were scored.
 
 Gap names are merged case-insensitively. On report days the CSV is attached to the report instead of the daily digest.

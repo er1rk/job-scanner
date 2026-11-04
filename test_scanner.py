@@ -147,7 +147,8 @@ class EndToEndTests(unittest.TestCase):
     def test_full_run_saves_everything_and_dedupes(self):
         with tempfile.TemporaryDirectory() as tmp:
             send = self.run_main(tmp, [], {"ATTACH_CSV": "true"})
-            good, csv_text, warning, waiting = send.call_args.args
+            good, csv_text, warning, waiting, triaged = send.call_args.args
+            self.assertEqual(triaged, 0)
             self.assertEqual(waiting, 0)
             self.assertEqual([r["id"] for r in good], ["111"])  # "Senior" offer dropped by title
             self.assertIn("8000", csv_text)
@@ -479,6 +480,51 @@ class SourceParsingTests(unittest.TestCase):
         self.assertEqual([o["id"] for o in offers], ["jj:acme-data-analyst-warszawa"])
 
 
+class TriageTests(unittest.TestCase):
+    def offers(self, n):
+        return [{"id": str(i), "title": f"Job {i}", "company": "C", "location": "L", "source": "linkedin"}
+                for i in range(n)]
+
+    def test_batches_keep_and_drop(self):
+        calls = []
+        def fake_call(prompt, schema, cfg, key, temperature=0.2):
+            calls.append(prompt)
+            return {"keep": [1, 3, 99]}  # 99 is out of range and ignored
+        with mock.patch.object(scanner, "call_gemini", side_effect=fake_call), mock.patch("time.sleep"):
+            kept, dropped = scanner.triage_offers(self.offers(7), "profile", {"triage_batch_size": 5}, "k")
+        self.assertEqual(len(calls), 2)                                  # 5 + 2
+        self.assertIn("5. Job 4 | C | L | LinkedIn", calls[0])
+        self.assertEqual([o["id"] for o in kept], ["0", "2", "5"])       # 1st and 3rd of each batch
+        self.assertEqual([o["id"] for o in dropped], ["1", "3", "4", "6"])
+
+    def test_fails_open(self):
+        for answer in (None, {"wrong": 1}, {"keep": []}):
+            with mock.patch.object(scanner, "call_gemini", return_value=answer), mock.patch("time.sleep"):
+                kept, dropped = scanner.triage_offers(self.offers(6), "p", {}, "k")
+            self.assertEqual((len(kept), len(dropped)), (6, 0), answer)
+
+    def test_switched_off(self):
+        with mock.patch.object(scanner, "call_gemini") as call:
+            kept, dropped = scanner.triage_offers(self.offers(3), "p", {"triage": False}, "k")
+        call.assert_not_called()
+        self.assertEqual(len(kept), 3)
+
+    def test_dropped_offers_are_stored_seen_and_not_scored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = EndToEndTests.run_main
+            def triage_drop_all_but_none(offers, profile, cfg, key):
+                return [], offers
+            with mock.patch.object(scanner, "triage_offers", side_effect=triage_drop_all_but_none):
+                send = run(self, tmp, [], {})
+            send.assert_not_called()                                     # nothing scored, nothing to send
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual(store.count(), 0)
+            self.assertEqual([t["id"] for t in store.triaged_since("2000")], ["111"])
+            self.assertIn("111", store.seen_ids())
+            self.assertEqual(store.con.execute("SELECT triaged_out FROM runs").fetchone()[0], 1)
+            store.close()
+
+
 class RocketJobsTests(unittest.TestCase):
     def test_same_platform_different_site(self):
         urls = []
@@ -543,6 +589,19 @@ class MultiSourceRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(sources.pracuj, "search", side_effect=KeyError("layout changed")):
             send = self.run_main(tmp, [], {}, sources=["pracuj", "linkedin"])
-            good, _, warning, _ = send.call_args.args
+            good, _, warning, _, _ = send.call_args.args
             self.assertEqual([r["id"] for r in good], ["111"])
             self.assertIn("pracuj.pl", warning)
+
+
+class ReportTriageTests(unittest.TestCase):
+    def test_triaged_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Store(Path(tmp) / "jobs.db")
+            st.save_triaged([{"id": "t1", "title": "Java Developer", "company": "X", "source": "pracuj"}])
+            stats = report.compute_stats(st, threshold=60)
+            st.close()
+        self.assertEqual(stats["triaged_out"], 1)
+        # an empty week still renders without the section; a week with offers shows it
+        stats["offers"] = 1
+        self.assertIn("Java Developer · X", report.build_report_html(stats))

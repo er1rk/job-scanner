@@ -307,6 +307,46 @@ def call_gemini(prompt: str, schema: dict, cfg: dict, api_key: str, temperature:
     return None
 
 
+TRIAGE_PROMPT = """You pre-screen job offers for the candidate below before a detailed review.
+For every numbered offer you only see title, company, location and portal. Decide which are worth a detailed review.
+Drop ONLY offers that are clearly not a fit, for example:
+- a different profession (software developer/engineer, sales representative, accountant, recruiter, designer,
+  nurse, driver...) that does not match the candidate's target roles;
+- seniority clearly above the candidate (senior, lead, head of, manager, director, principal, expert);
+- a language requirement in the title the candidate does not speak.
+When unsure, KEEP the offer - a detailed review follows. Return the numbers of the offers to keep."""
+
+TRIAGE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {"keep": {"type": "ARRAY", "items": {"type": "INTEGER"}}},
+    "required": ["keep"],
+}
+
+
+def triage_offers(offers: list[dict], profile: str, cfg: dict, api_key: str) -> tuple[list[dict], list[dict]]:
+    """One cheap Gemini call per batch of titles drops clear mismatches before the per-offer scoring.
+    Fails open: if a batch can't be triaged, all its offers are kept."""
+    if not cfg.get("triage", True) or not offers:
+        return offers, []
+    size = int(cfg.get("triage_batch_size", 60))
+    kept, dropped = [], []
+    for start in range(0, len(offers), size):
+        batch = offers[start:start + size]
+        lines = "\n".join(f"{i}. {o.get('title', '')} | {o.get('company', '')} | {o.get('location', '')} | "
+                          f"{sources.label(o.get('source'))}" for i, o in enumerate(batch, 1))
+        res = call_gemini(f"{TRIAGE_PROMPT}\n\n### Candidate profile\n{profile}\n\n### Offers\n{lines}",
+                          TRIAGE_SCHEMA, cfg, api_key, temperature=0.0)
+        keep = {i for i in (res or {}).get("keep", []) if isinstance(i, int) and 1 <= i <= len(batch)}
+        if res is None or "keep" not in res or (not keep and len(batch) >= 5):
+            # failed call, malformed answer or a suspicious "drop everything" -> keep the whole batch
+            kept += batch
+        else:
+            kept += [o for i, o in enumerate(batch, 1) if i in keep]
+            dropped += [o for i, o in enumerate(batch, 1) if i not in keep]
+        time.sleep(6)
+    return kept, dropped
+
+
 def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key: str) -> dict | None:
     prompt = (
         f"{RUBRIC}\n\n### Candidate profile\n{profile}\n\n### Job offer\n"
@@ -323,7 +363,8 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
 
 
 # ---------------------------------------------------------------- E-mail
-def build_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0) -> str:
+def build_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0,
+                triaged_out: int = 0) -> str:
     """HTML body of the digest (kept separate from sending so it can be previewed/tested)."""
     colour = {"apply": "#1a7f37", "stretch": "#b08800", "skip": "#cf222e"}
     rows = []
@@ -354,6 +395,9 @@ def build_email(results: list[dict], csv_text: str | None = None, warning: str =
                      f"<table style='border-collapse:collapse;font-family:Arial,sans-serif'>{''.join(rows)}</table>")
     else:
         parts.append("<p>No new offers above the threshold today.</p>")
+    if triaged_out:
+        parts.append(f"<p style='color:#555'>The AI pre-filter skipped {triaged_out} clearly unrelated offers "
+                     f"(listed in the weekly report data).</p>")
     if waiting:
         parts.append(f"<p style='color:#555'>{waiting} more offers are waiting in the queue and will be "
                      f"scored on the next run(s).</p>")
@@ -382,12 +426,13 @@ def send_html(subject: str, body_html: str, csv_text: str | None = None) -> None
     print(f"E-mail sent: {subject.split(':')[0]}")
 
 
-def send_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0) -> None:
+def send_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0,
+               triaged_out: int = 0) -> None:
     if results:
         subject = f"Job scan {date.today():%d.%m}: {len(results)} offers, best {results[0]['score']}/100"
     else:
         subject = f"Job scan {date.today():%d.%m}: " + ("check the scraper" if warning else "data export")
-    send_html(subject, build_email(results, csv_text, warning, waiting), csv_text)
+    send_html(subject, build_email(results, csv_text, warning, waiting, triaged_out), csv_text)
 
 
 def send_weekly_report(store: Store, cfg: dict, profile: str | None, api_key: str | None,
@@ -477,7 +522,12 @@ def main() -> None:
     new = fetch_offers(cfg, set() if ignore_seen else store.seen_ids(),
                        set() if ignore_seen else store.recent_fingerprints(), stats)
     backlog_ids = {o["id"] for o in backlog}
-    candidates = backlog + [o for o in new if o["id"] not in backlog_ids]
+    new = [o for o in new if o["id"] not in backlog_ids]
+    new, triaged_out = triage_offers(new, profile, cfg, api_key)
+    store.save_triaged(triaged_out)  # kept for review; marked as seen so they are not triaged again
+    if cfg.get("triage", True):
+        print(f"AI pre-filter: kept {len(new)}, dropped {len(triaged_out)}")
+    candidates = backlog + new
     cap = int(cfg["max_offers_per_run"])
     offers, overflow = candidates[:cap], candidates[cap:]
     store.enqueue(overflow)  # nothing over the cap is lost - it is scored on the next run
@@ -547,14 +597,14 @@ def main() -> None:
     # On report days the CSV travels with the weekly report instead of the daily digest
     digest_csv = None if report_due else csv_text
     if good or digest_csv or warning:
-        send_email(good, digest_csv, warning, waiting)
+        send_email(good, digest_csv, warning, waiting, len(triaged_out))
         store.mark_notified([r["id"] for r in good])
     if report_due:
         send_weekly_report(store, cfg, profile, api_key, csv_text)
 
     store.save_run({**stats, "finished_at": now_iso(), "scored": len(results), "failed": failed,
                     "notified": len(good), "model": cfg["gemini_model"],
-                    "queued": waiting, "queue_expired": expired})
+                    "queued": waiting, "queue_expired": expired, "triaged_out": len(triaged_out)})
     close_db(store)
 
 

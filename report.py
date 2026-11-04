@@ -141,6 +141,8 @@ def compute_stats(store, threshold: int, days: int = 7, now: datetime | None = N
                 "apply": sum(r["verdict"] == "apply" for r in rs)}
                for src, rs in sorted(by_src.items(), key=lambda kv: -len(kv[1]))]
 
+    triaged = store.triaged_since(start.isoformat()) if hasattr(store, "triaged_since") else []
+
     verdicts = Counter(r["verdict"] for r in week)
     return {
         "period_start": start.date().isoformat(), "period_end": now.date().isoformat(),
@@ -158,6 +160,8 @@ def compute_stats(store, threshold: int, days: int = 7, now: datetime | None = N
         "top_required_tools": tools,
         "categories": categories,
         "sources": portals,
+        "triaged_out": len(triaged),
+        "triaged_sample": [f"{t['title']} · {t['company']}" for t in triaged[-12:]],
         "best_offers": [{"title": r["title"], "company": r["company"], "score": r["score"], "url": r["url"]}
                         for r in sorted(week, key=lambda r: -(r["score"] or 0))[:5]],
     }
@@ -167,7 +171,7 @@ def ai_recommendations(stats: dict, profile: str, call: Callable[..., dict | Non
     """`call` is scanner.call_gemini bound to cfg/api key: call(prompt, schema) -> dict | None."""
     if stats["offers"] < MIN_OFFERS_FOR_AI:
         return None
-    data = {k: v for k, v in stats.items() if k != "best_offers"}  # no URLs/company names needed
+    data = {k: v for k, v in stats.items() if k not in ("best_offers", "triaged_sample")}  # no URLs/company names needed
     prompt = (f"{RECS_PROMPT}\n\n### Candidate profile\n{profile}\n\n"
               f"### Last week's statistics (JSON)\n{json.dumps(data, ensure_ascii=False, indent=1)}")
     recs = call(prompt, RECS_SCHEMA)
@@ -288,6 +292,14 @@ def build_report_html(stats: dict, recs: dict | None = None, csv_attached: bool 
         out.append(f"<li><b>{o['score']}</b> – <a href='{e(o['url'] or '')}'>{e(o['title'] or '')}</a>"
                    f" · {e(o['company'] or '')}</li>")
     out.append("</ol>")
+
+    if stats.get("triaged_out"):
+        out.append(f"<h2 {h2}>Skipped by the AI pre-filter</h2><div style='color:#57606a;font-size:12px'>"
+                   f"{stats['triaged_out']} offers were dropped this week on title alone. Latest ones – check that "
+                   f"nothing relevant is being filtered out:</div><ul style='margin:6px 0;padding-left:20px;"
+                   f"color:#57606a;font-size:13px'>")
+        out += [f"<li>{e(x)}</li>" for x in stats["triaged_sample"]]
+        out.append("</ul>")
 
     foot = f"{stats['offers_total']} offers in the database."
     if csv_attached:
