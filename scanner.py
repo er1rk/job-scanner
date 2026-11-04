@@ -4,11 +4,13 @@ AI Job Scanner
 1. Pulls fresh job offers from LinkedIn's public job search (no login).
 2. Filters out obvious mismatches by title.
 3. Asks Google Gemini to score each offer against the candidate profile
-   using a recruiter-style rubric (0-100).
-4. E-mails the best matches and remembers what it has already seen.
+   using a recruiter-style rubric (0-100) and to extract structured facts
+   (salary, work mode, contract, required tools, English level...).
+4. Saves every scored offer to SQLite (data/jobs.db) and e-mails the best matches.
 
-Run locally:   python scanner.py --dry-run      (prints results, sends nothing)
+Run locally:   python scanner.py --dry-run      (prints results, sends nothing, saves nothing)
 Run for real:  python scanner.py                (needs env vars, see README)
+Export data:   python scanner.py --export       (writes data/jobs.csv for Power BI / Excel)
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import re
 import smtplib
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -30,8 +32,12 @@ import requests
 import yaml
 from bs4 import BeautifulSoup
 
+from storage import Store, now_iso
+
 ROOT = Path(__file__).parent
-SEEN_FILE = ROOT / "data" / "seen.json"
+SEEN_FILE = ROOT / "data" / "seen.json"   # legacy cache, migrated into the database on first run
+DB_FILE = ROOT / "data" / "jobs.db"
+CSV_FILE = ROOT / "data" / "jobs.csv"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -61,18 +67,6 @@ def load_profile() -> str:
         if p.exists():
             return p.read_text(encoding="utf-8")
     sys.exit("No candidate profile found (set CANDIDATE_PROFILE or create profile.md)")
-
-
-def load_seen() -> set:
-    if SEEN_FILE.exists():
-        return set(json.loads(SEEN_FILE.read_text()))
-    return set()
-
-
-def save_seen(seen: set) -> None:
-    SEEN_FILE.parent.mkdir(exist_ok=True)
-    # keep the file small: last 3000 ids are plenty for de-duplication
-    SEEN_FILE.write_text(json.dumps(sorted(seen)[-3000:]))
 
 
 def get(url: str, retries: int = 3) -> str | None:
@@ -134,10 +128,11 @@ def build_searches(cfg: dict) -> list[dict]:
     return searches
 
 
-def fetch_offers(cfg: dict, seen: set) -> list[dict]:
+def fetch_offers(cfg: dict, seen: set, stats: dict) -> list[dict]:
     secs = int(cfg["posted_within_hours"]) * 3600
     excluded = [w.lower() for w in cfg.get("exclude_title_keywords", [])]
     found: dict[str, dict] = {}
+    cards_total, filtered = 0, set()
     for s in build_searches(cfg):
         for page in range(int(cfg.get("pages_per_search", 1))):
             url = SEARCH_URL.format(kw=quote_plus(s["keywords"]), loc=quote_plus(s["location"]),
@@ -148,16 +143,22 @@ def fetch_offers(cfg: dict, seen: set) -> list[dict]:
             if not html:
                 break
             cards = parse_search(html)
+            cards_total += len(cards)
             for o in cards:
                 if o["id"] in seen or o["id"] in found:
                     continue
                 if any(w in o["title"].lower() for w in excluded):
+                    filtered.add(o["id"])
                     continue
+                o["search_keyword"] = s["keywords"]
                 found[o["id"]] = o
             time.sleep(2)
             if len(cards) < 25:  # no more pages
                 break
-    print(f"Searches run: {len(build_searches(cfg))}, unique new offers: {len(found)}")
+    stats.update(searches=len(build_searches(cfg)), cards_found=cards_total,
+                 filtered_title=len(filtered), new_offers=len(found))
+    print(f"Searches run: {stats['searches']}, cards: {cards_total}, "
+          f"dropped by title: {len(filtered)}, unique new offers: {len(found)}")
     return list(found.values())[: int(cfg["max_offers_per_run"])]
 
 
@@ -170,20 +171,77 @@ RUBRIC = """You are a strict technical recruiter. Score how well the candidate f
 - nice-to-haves and industry: max 15
 Subtract points for excluding conditions (e.g. required degree/certificate the candidate lacks,
 required language they don't speak, far more years required). Do NOT penalise work mode (remote/hybrid/office).
-Never assume skills the profile does not state. Answer in English."""
+Never assume skills the profile does not state. Answer in English.
+
+Write each gap as a short, reusable skill/requirement name (e.g. "SQL", "SAP", "German C1",
+"3+ years in AML") so gaps can be counted across many offers.
+
+Also extract facts from the offer itself (independent of the candidate). Use null when the offer
+does not state something - never guess salaries. Salary: copy the numbers as written, with their
+currency, period (hour/day/month/year) and whether they are gross, net or B2B net ("unknown" if unclear).
+required_tools / nice_to_have_tools: concrete tools and technologies only (Excel, Power BI, SQL, Python, SAP...)."""
 
 SCHEMA = {
     "type": "OBJECT",
     "properties": {
+        # --- fit
         "score": {"type": "INTEGER"},
         "verdict": {"type": "STRING", "enum": ["apply", "stretch", "skip"]},
-        "seniority": {"type": "STRING"},
+        "seniority": {"type": "STRING", "enum": ["intern", "junior", "mid", "senior", "lead", "unknown"]},
         "strengths": {"type": "ARRAY", "items": {"type": "STRING"}},
         "gaps": {"type": "ARRAY", "items": {"type": "STRING"}},
         "one_line_reason": {"type": "STRING"},
+        # --- facts about the offer
+        "role_category": {"type": "STRING", "enum": [
+            "data/BI analytics", "fraud/AML/KYC/compliance", "risk", "trust & safety/brand protection",
+            "business analysis", "finance/operations", "AI/data annotation", "other"]},
+        "industry": {"type": "STRING", "nullable": True},
+        "work_mode": {"type": "STRING", "enum": ["remote", "hybrid", "on-site", "unknown"]},
+        "contract_types": {"type": "ARRAY", "items": {"type": "STRING", "enum": [
+            "employment contract", "B2B", "mandate contract", "other"]}},
+        "salary_min": {"type": "NUMBER", "nullable": True},
+        "salary_max": {"type": "NUMBER", "nullable": True},
+        "salary_currency": {"type": "STRING", "nullable": True},
+        "salary_period": {"type": "STRING", "nullable": True, "enum": ["hour", "day", "month", "year"]},
+        "salary_type": {"type": "STRING", "nullable": True, "enum": ["gross", "net", "unknown"]},
+        "years_required": {"type": "NUMBER", "nullable": True},
+        "english_level": {"type": "STRING", "enum": ["none", "A2", "B1", "B2", "C1", "C2", "unknown"]},
+        "polish_required": {"type": "BOOLEAN", "nullable": True},
+        "required_tools": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "nice_to_have_tools": {"type": "ARRAY", "items": {"type": "STRING"}},
     },
-    "required": ["score", "verdict", "strengths", "gaps", "one_line_reason"],
+    "required": ["score", "verdict", "strengths", "gaps", "one_line_reason",
+                 "role_category", "work_mode", "english_level", "required_tools"],
 }
+
+PERIOD_TO_MONTH = {"hour": 168, "day": 21, "month": 1, "year": 1 / 12}
+
+
+def normalise_salary(s: dict, cfg: dict) -> dict:
+    """Convert the extracted range to PLN per month so offers can be compared.
+    Gross vs. B2B net is NOT converted - salary_type stays in the data for filtering."""
+    rates = {k.upper(): v for k, v in (cfg.get("fx_to_pln") or {"PLN": 1}).items()}
+    cur = (s.get("salary_currency") or "").upper().strip()
+    cur = {"ZŁ": "PLN", "ZL": "PLN", "€": "EUR", "$": "USD", "£": "GBP"}.get(cur, cur)
+    factor = PERIOD_TO_MONTH.get(s.get("salary_period") or "month")
+    out = {"salary_min_pln_month": None, "salary_max_pln_month": None}
+    if cur in rates and factor:
+        for k in ("min", "max"):
+            v = s.get(f"salary_{k}")
+            if isinstance(v, (int, float)) and v > 0:
+                out[f"salary_{k}_pln_month"] = round(v * factor * rates[cur])
+    return out
+
+
+def salary_label(r: dict) -> str:
+    lo, hi = r.get("salary_min"), r.get("salary_max")
+    if not (lo or hi):
+        return ""
+    rng = f"{lo:,.0f}–{hi:,.0f}" if lo and hi and lo != hi else f"{(lo or hi):,.0f}"
+    parts = [rng.replace(",", " "), r.get("salary_currency") or "", "/ " + (r.get("salary_period") or "month")]
+    if r.get("salary_type") and r["salary_type"] != "unknown":
+        parts.append(r["salary_type"])
+    return " ".join(p for p in parts if p)
 
 
 def pick_available_model(api_key: str, exclude: str = "") -> str | None:
@@ -251,39 +309,71 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
             return None
         try:
             text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
+            result = json.loads(text)
         except (KeyError, IndexError, json.JSONDecodeError):
             return None
+        result["score"] = max(0, min(100, int(result.get("score") or 0)))
+        result["model"] = cfg["gemini_model"]
+        result.update(normalise_salary(result, cfg))
+        return result
     return None
 
 
 # ---------------------------------------------------------------- E-mail
-def send_email(results: list[dict]) -> None:
+def build_email(results: list[dict], csv_text: str | None = None, warning: str = "") -> str:
+    """HTML body of the digest (kept separate from sending so it can be previewed/tested)."""
+    colour = {"apply": "#1a7f37", "stretch": "#b08800", "skip": "#cf222e"}
+    rows = []
+    for r in results:
+        facts = " · ".join(x for x in (
+            salary_label(r),
+            r.get("work_mode") if r.get("work_mode") not in (None, "unknown") else "",
+            ", ".join(r.get("contract_types") or []),
+            f"EN {r['english_level']}" if r.get("english_level") not in (None, "unknown", "none") else "",
+        ) if x)
+        tools = ", ".join(r.get("required_tools") or [])
+        rows.append(f"""<tr>
+          <td style="padding:10px;font-size:20px;font-weight:bold;vertical-align:top;color:{colour.get(r['verdict'], '#333')}">{r['score']}</td>
+          <td style="padding:10px">
+            <a href="{html.escape(r['url'])}" style="font-weight:bold;font-size:15px">{html.escape(r['title'])}</a><br>
+            <span style="color:#555">{html.escape(r['company'])} · {html.escape(r['location'])}</span><br>
+            {f'<span style="color:#333">{html.escape(facts)}</span><br>' if facts else ''}
+            {f'<span style="color:#555">Tools: {html.escape(tools)}</span><br>' if tools else ''}
+            <i>{html.escape(r['one_line_reason'])}</i><br>
+            <span style="color:#1a7f37">+ {html.escape('; '.join(r['strengths']))}</span><br>
+            <span style="color:#cf222e">− {html.escape('; '.join(r['gaps']))}</span>
+          </td></tr>""")
+    parts = []
+    if warning:
+        parts.append(f"<p style='background:#fff8c5;padding:10px;border-radius:6px'>⚠️ {html.escape(warning)}</p>")
+    if results:
+        parts.append(f"<h2>{len(results)} new matching offers</h2>"
+                     f"<table style='border-collapse:collapse;font-family:Arial,sans-serif'>{''.join(rows)}</table>")
+    else:
+        parts.append("<p>No new offers above the threshold today.</p>")
+    if csv_text:
+        parts.append("<p style='color:#555'>Attached: <b>jobs.csv</b> - every scored offer so far "
+                     "(ready for Power BI / Excel).</p>")
+    return "<div style='font-family:Arial,sans-serif'>" + "".join(parts) + "</div>"
+
+
+def send_email(results: list[dict], csv_text: str | None = None, warning: str = "") -> None:
     sender, password = os.getenv("EMAIL_ADDRESS"), os.getenv("EMAIL_APP_PASSWORD")
     if not (sender and password):
         print("E-mail not configured - skipping notification")
         return
     to = os.getenv("EMAIL_TO") or sender
-    colour = {"apply": "#1a7f37", "stretch": "#b08800", "skip": "#cf222e"}
-    rows = "".join(
-        f"""<tr>
-          <td style="padding:10px;font-size:20px;font-weight:bold;color:{colour.get(r['verdict'], '#333')}">{r['score']}</td>
-          <td style="padding:10px">
-            <a href="{r['url']}" style="font-weight:bold;font-size:15px">{html.escape(r['title'])}</a><br>
-            <span style="color:#555">{html.escape(r['company'])} · {html.escape(r['location'])}</span><br>
-            <i>{html.escape(r['one_line_reason'])}</i><br>
-            <span style="color:#1a7f37">+ {html.escape('; '.join(r['strengths']))}</span><br>
-            <span style="color:#cf222e">− {html.escape('; '.join(r['gaps']))}</span>
-          </td></tr>"""
-        for r in results
-    )
-    body = (f"<h2>{len(results)} new matching offers</h2>"
-            f"<table style='border-collapse:collapse;font-family:Arial,sans-serif'>{rows}</table>")
     msg = EmailMessage()
-    msg["Subject"] = f"Job scan {date.today():%d.%m}: {len(results)} offers, best {results[0]['score']}/100"
+    if results:
+        msg["Subject"] = f"Job scan {date.today():%d.%m}: {len(results)} offers, best {results[0]['score']}/100"
+    else:
+        msg["Subject"] = f"Job scan {date.today():%d.%m}: " + ("check the scraper" if warning else "data export")
     msg["From"], msg["To"] = sender, to
     msg.set_content("Open this e-mail in an HTML-capable client.")
-    msg.add_alternative(body, subtype="html")
+    msg.add_alternative(build_email(results, csv_text, warning), subtype="html")
+    if csv_text:
+        msg.add_attachment(csv_text.encode("utf-8"), maintype="text", subtype="csv",
+                           filename=f"jobs_{date.today():%Y-%m-%d}.csv")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(sender, password)
         smtp.send_message(msg)
@@ -294,51 +384,88 @@ def send_email(results: list[dict]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="print results, don't notify or save state")
+    ap.add_argument("--export", action="store_true", help="write data/jobs.csv from the database and exit")
     args = ap.parse_args()
 
     cfg = load_config()
+    if args.export:
+        store = Store(DB_FILE)
+        CSV_FILE.write_text(store.export_csv(), encoding="utf-8")
+        print(f"Exported {store.count()} offers to {CSV_FILE}")
+        store.close()
+        return
+
     # Optional overrides for manual test runs (set from the "Run workflow" form)
     if os.getenv("HOURS"):
         cfg["posted_within_hours"] = int(os.getenv("HOURS"))
     if os.getenv("MIN_SCORE"):
         cfg["min_score_to_notify"] = int(os.getenv("MIN_SCORE"))
     ignore_seen = os.getenv("IGNORE_SEEN", "").lower() == "true"
+    force_csv = os.getenv("ATTACH_CSV", "").lower() == "true"
     profile = load_profile()
     api_key = os.getenv("GEMINI_API_KEY") or sys.exit("Set GEMINI_API_KEY")
-    seen = load_seen()
 
-    offers = fetch_offers(cfg, set() if ignore_seen else seen)
+    # dry runs use a throw-away in-memory database, so they never change saved state
+    store = Store(Path(":memory:") if args.dry_run else DB_FILE)
+    if not args.dry_run:
+        migrated = store.import_legacy_seen(SEEN_FILE)
+        if migrated:
+            print(f"Migrated {migrated} ids from seen.json into the database")
+    stats = {"started_at": now_iso()}
+
+    offers = fetch_offers(cfg, set() if ignore_seen else store.seen_ids(), stats)
     print(f"New offers to score: {len(offers)}")
 
-    results = []
+    results, failed = [], 0
     for i, o in enumerate(offers, 1):
-        html = get(DETAIL_URL.format(id=o["id"]))
-        desc = parse_detail(html) if html else ""
+        page = get(DETAIL_URL.format(id=o["id"]))
+        desc = parse_detail(page) if page else ""
         if not desc:
-            seen.add(o["id"])
+            store.mark_seen(o["id"])
             continue
         s = score_offer(o, desc, profile, cfg, api_key)
         if s:
-            seen.add(o["id"])  # only remember offers that were actually scored
-            results.append({**o, **s})
+            row = {**o, **s, "first_seen": now_iso()}
+            store.save_offer(row, desc)  # every scored offer is kept, not only the good ones
+            results.append(row)
             if args.dry_run:
                 print(f"[{i}/{len(offers)}] {s['score']:>3}  {o['title']} – {o['company']} ({o['location']})")
+        else:
+            failed += 1  # not saved -> will be retried on the next run
         time.sleep(6)  # stay under the free-tier requests-per-minute limit
 
     good = sorted((r for r in results if r["score"] >= cfg["min_score_to_notify"]),
                   key=lambda r: r["score"], reverse=True)
-    print(f"Scored: {len(results)}, above threshold: {len(good)}")  # counts only - logs may be public
+    print(f"Scored: {len(results)}, failed: {failed}, above threshold: {len(good)}, "
+          f"in database: {store.count()}")  # counts only - logs may be public
+
+    # LinkedIn returning nothing at all almost always means the page layout changed or we got blocked
+    warning = ""
+    if stats.get("searches") and not stats.get("cards_found"):
+        warning = ("The scraper found 0 offers across all searches - LinkedIn may have changed its "
+                   "page layout or blocked the request. Check the latest Actions log.")
 
     if args.dry_run:
         for r in good:
             print(f"\n{r['score']}/100 {r['verdict'].upper()} – {r['title']} – {r['company']}\n{r['url']}")
+            if salary_label(r):
+                print(f"  {salary_label(r)} · {r.get('work_mode')}")
             print("  + " + "\n  + ".join(r["strengths"]))
             print("  - " + "\n  - ".join(r["gaps"]))
+        if warning:
+            print("WARNING: " + warning)
+        store.close()
         return
 
-    if good:
-        send_email(good)
-    save_seen(seen)
+    attach = force_csv or datetime.now().weekday() in (cfg.get("attach_csv_weekdays") or [])
+    csv_text = store.export_csv() if attach and store.count() else None
+    if good or csv_text or warning:
+        send_email(good, csv_text, warning)
+        store.mark_notified([r["id"] for r in good])
+
+    store.save_run({**stats, "finished_at": now_iso(), "scored": len(results), "failed": failed,
+                    "notified": len(good), "model": cfg["gemini_model"]})
+    store.close()
 
 
 if __name__ == "__main__":
