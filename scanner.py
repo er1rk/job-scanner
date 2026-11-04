@@ -186,7 +186,7 @@ SCHEMA = {
 }
 
 
-def pick_available_model(api_key: str) -> str | None:
+def pick_available_model(api_key: str, exclude: str = "") -> str | None:
     """If the configured model doesn't exist for this key, find a Flash model that does."""
     r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
                      params={"key": api_key, "pageSize": 200}, timeout=30)
@@ -195,7 +195,8 @@ def pick_available_model(api_key: str) -> str | None:
         return None
     names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
              if "generateContent" in m.get("supportedGenerationMethods", [])]
-    flash = [n for n in names if "flash" in n and not any(x in n for x in ("tts", "image", "live", "embedding"))]
+    flash = [n for n in names if "flash" in n and n != exclude
+             and not any(x in n for x in ("tts", "image", "live", "embedding"))]
     # prefer stable over preview, newest first
     flash.sort(key=lambda n: ("preview" in n or "exp" in n, [-int(x) for x in re.findall(r"\d+", n)[:2]]))
     print(f"  Available Flash models: {', '.join(flash[:6]) or 'none'}")
@@ -216,7 +217,7 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
             "responseSchema": SCHEMA,
         },
     }
-    for attempt in range(3):
+    for attempt in range(5):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['gemini_model']}:generateContent"
         try:
             r = requests.post(url, params={"key": api_key}, json=body, timeout=120)
@@ -226,6 +227,16 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
             continue
         if r.status_code == 429:  # free-tier rate limit
             time.sleep(30 * (attempt + 1))
+            continue
+        if r.status_code in (500, 503):  # model overloaded - wait, then switch to another model
+            if attempt >= 1 and not cfg.get("_fallback_used"):
+                cfg["_fallback_used"] = True
+                m = pick_available_model(api_key, exclude=cfg["gemini_model"])
+                if m:
+                    print(f"  '{cfg['gemini_model']}' overloaded - switching to {m}")
+                    cfg["gemini_model"] = m
+                    continue
+            time.sleep(15 * (attempt + 1))
             continue
         if r.status_code == 404 and not cfg.get("_model_checked"):
             cfg["_model_checked"] = True
