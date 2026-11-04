@@ -11,7 +11,7 @@ locations:
 include_remote_poland: true
 
 # Portals to search (see sources/). Remove one to switch it off.
-sources: [linkedin, pracuj, nofluffjobs, justjoin]
+sources: [linkedin, pracuj, nofluffjobs, justjoin, rocketjobs]
 
 # Only offers posted in the last N hours
 posted_within_hours: 24

@@ -11,7 +11,7 @@ from unittest import mock
 import report
 import scanner
 import sources
-from sources import common, justjoin, nofluffjobs, pracuj
+from sources import common, justjoin, nofluffjobs, pracuj, rocketjobs
 from storage import Store
 
 SEARCH_HTML = """
@@ -477,6 +477,25 @@ class SourceParsingTests(unittest.TestCase):
         with mock.patch.object(common, "get_json", return_value=JJ_SEARCH), mock.patch("time.sleep"):
             offers = justjoin.search(SEARCHES[:1], {"pages_per_search": 1}, 24)
         self.assertEqual([o["id"] for o in offers], ["jj:acme-data-analyst-warszawa"])
+
+
+class RocketJobsTests(unittest.TestCase):
+    def test_same_platform_different_site(self):
+        urls = []
+        def fake_json(url, **kw):
+            urls.append(url)
+            return JJ_SEARCH
+        with mock.patch.object(common, "get_json", side_effect=fake_json), \
+             mock.patch.object(common, "get", return_value=JJ_DETAIL), mock.patch("time.sleep"):
+            offers = rocketjobs.search(SEARCHES, {"pages_per_search": 1}, 24)
+            text = rocketjobs.detail(offers[0])
+        self.assertTrue(urls[0].startswith("https://rocketjobs.pl/api/candidate-api/offers?"))
+        self.assertEqual(offers[0]["id"], "rj:acme-data-analyst-warszawa")
+        self.assertEqual(offers[0]["url"], "https://rocketjobs.pl/oferta-pracy/acme-data-analyst-warszawa")
+        self.assertEqual(offers[0]["source"], "rocketjobs")
+        self.assertIn("We need SQL", text)
+        self.assertEqual(sources.label("rocketjobs"), "RocketJobs")
+        self.assertIn("rocketjobs", sources.ALL)
 
 
 class MultiSourceRunTests(unittest.TestCase):

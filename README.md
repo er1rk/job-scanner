@@ -2,11 +2,11 @@
 
 A small automation that finds fresh job offers and scores them against my profile with an LLM, so every morning I only read the offers worth applying to. Every scored offer is also stored, so over time the scanner builds a dataset of the job market I'm targeting.
 
-**Pipeline:** LinkedIn + pracuj.pl + No Fluff Jobs + justjoin.it → title filter → cross-portal de-duplication → Google Gemini (structured JSON: fit score + extracted facts) → SQLite → daily HTML e-mail + weekly market & skill-gap report (with CSV export for Power BI)
+**Pipeline:** LinkedIn + pracuj.pl + No Fluff Jobs + justjoin.it + RocketJobs → title filter → cross-portal de-duplication → Google Gemini (structured JSON: fit score + extracted facts) → SQLite → daily HTML e-mail + weekly market & skill-gap report (with CSV export for Power BI)
 **Runs:** every weekday on GitHub Actions (free), no server needed.
 
 ## How it works
-1. `scanner.py` pulls offers posted in the last 24 h for the searches in `config.yaml` from every portal listed under `sources` (one module per portal in `sources/`: LinkedIn's public job search, the JSON pracuj.pl embeds in its pages, the No Fluff Jobs API and the justjoin.it API). A portal that fails doesn't stop the others – the e-mail says which one broke.
+1. `scanner.py` pulls offers posted in the last 24 h for the searches in `config.yaml` from every portal listed under `sources` (one module per portal in `sources/`: LinkedIn's public job search, the JSON pracuj.pl embeds in its pages, the No Fluff Jobs API and the API shared by justjoin.it and its non-IT sister site RocketJobs). A portal that fails doesn't stop the others – the e-mail says which one broke.
    The same job is often listed on several portals; offers with the same normalised company + title (legal forms like *Sp. z o.o.* and gender tags like *(k/m)* removed) are scored only once. When the per-run cap is reached, portals share it round-robin.
 2. Obvious mismatches (e.g. *senior*, *internship*) are dropped by title before any AI call, saving tokens. Optionally `include_title_keywords` keeps only titles containing one of the given words – useful because some portals match keywords loosely.
    At most `max_offers_per_run` offers are scored per run; the rest go to a **queue** in the database and are scored first on the next run (queued offers older than `queue_max_age_days` are dropped, failed ones are retried up to 3 times). The digest says how many offers are still waiting.
