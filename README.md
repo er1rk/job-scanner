@@ -1,31 +1,46 @@
 # AI Job Scanner
 
-A small automation that finds fresh job offers and scores them against my profile with an LLM, so every morning I only read the offers worth applying to.
+A small automation that finds fresh job offers and scores them against my profile with an LLM, so every morning I only read the offers worth applying to. Every scored offer is also stored, so over time the scanner builds a dataset of the job market I'm targeting.
 
-**Pipeline:** LinkedIn public job search → title filter → Google Gemini (structured JSON scoring) → daily HTML e-mail
+**Pipeline:** LinkedIn public job search → title filter → Google Gemini (structured JSON: fit score + extracted facts) → SQLite → daily HTML e-mail (+ weekly CSV export for Power BI)
 **Runs:** every weekday on GitHub Actions (free), no server needed.
 
 ## How it works
 1. `scanner.py` pulls offers posted in the last 24 h for the searches in `config.yaml`.
 2. Obvious mismatches (e.g. *senior*, *internship*) are dropped by title before any AI call, saving tokens.
-3. Each remaining offer is sent to Gemini with a recruiter-style rubric (mandatory requirements 40, experience 20, education 15, languages 10, nice-to-haves 15). The response is forced into a JSON schema: score, verdict, strengths, gaps, one-line reason.
-4. Offers above the threshold are e-mailed as an HTML digest, best first. Already-seen offers are cached, so nothing is scored twice.
+3. Each remaining offer is sent to Gemini in **one call** that returns a JSON object enforced by a schema:
+   - **fit** – score from a recruiter-style rubric (mandatory requirements 40, experience 20, education 15, languages 10, nice-to-haves 15), verdict, strengths, gaps (as short reusable skill names), one-line reason;
+   - **facts about the offer** – role category, industry, work mode, contract types, salary range (currency, period, gross/net), years required, English level, whether Polish is required, required and nice-to-have tools.
+4. Salaries are normalised to **PLN per month** (`fx_to_pln` in `config.yaml`), so offers can be compared.
+5. **Every** scored offer – not only the good ones – is saved to `data/jobs.db` (SQLite), together with a compressed copy of the description for later re-scoring/evaluation. Each run is logged too (searches, offers found, filtered, scored, failed).
+6. Offers above the threshold are e-mailed as an HTML digest, best first. On Mondays (configurable) the full dataset is attached as `jobs.csv`.
+7. If LinkedIn returns 0 offers across all searches, the e-mail carries a warning – that usually means the page layout changed or the request was blocked, not that there are no jobs.
+
+## Data model
+| table | one row per | main columns |
+|---|---|---|
+| `offers` | scored offer | title, company, location, score, verdict, gaps, role_category, work_mode, salary_min/max_pln_month, required_tools, english_level, notified, user_label, status |
+| `runs` | scanner run | started/finished, searches, cards found, dropped by title, scored, failed, notified, model |
+
+List fields (gaps, tools, contract types) are exported to CSV joined with ` | ` – in Power Query use *Split column → By delimiter → Rows* to count e.g. the most common gaps.
 
 ## Privacy
-The real candidate profile and all API keys live in GitHub Secrets. Logs print counts only, so the repo can stay public.
+The real candidate profile and all API keys live in GitHub Secrets. The database is kept in the GitHub Actions cache, not in the repo, and logs print counts only, so the repo can stay public.
 
 ## Setup
 1. Get a Gemini API key at https://aistudio.google.com/apikey
 2. Create a Gmail app password (Google Account → Security → 2-Step Verification → App passwords)
 3. Add repository secrets: `GEMINI_API_KEY`, `CANDIDATE_PROFILE`, `EMAIL_ADDRESS`, `EMAIL_APP_PASSWORD` (optional `EMAIL_TO`)
-4. Actions → *Daily job scan* → *Run workflow* to test
+4. Actions → *Daily job scan* → *Run workflow* to test (tick *Attach the full dataset* to get the CSV right away)
 
-Local test:
+Local use:
 ```bash
 pip install -r requirements.txt
 export GEMINI_API_KEY=...
-python scanner.py --dry-run
+python scanner.py --dry-run     # prints results, saves and sends nothing
+python scanner.py --export      # data/jobs.db -> data/jobs.csv
+python -m unittest -v           # offline tests (no network, no API key)
 ```
 
 ## Tech
-Python · requests · BeautifulSoup · Google Gemini API (structured output) · SMTP e-mail · GitHub Actions (cron, secrets, cache)
+Python · requests · BeautifulSoup · Google Gemini API (structured output) · SQLite · SMTP e-mail · GitHub Actions (cron, secrets, cache)

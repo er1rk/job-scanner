@@ -55,3 +55,14 @@ min_score_to_notify: 60
 
 # Gemini model (if unavailable, the script picks an available Flash model automatically)
 gemini_model: "gemini-flash-lite-latest"
+
+# Approximate exchange rates used to compare salaries in PLN/month (update occasionally)
+fx_to_pln:
+  PLN: 1
+  EUR: 4.25
+  USD: 3.70
+  GBP: 4.95
+  CHF: 4.55
+
+# Attach the full dataset (jobs.csv) to the e-mail on these weekdays (0 = Monday ... 6 = Sunday)
+attach_csv_weekdays: [0]
