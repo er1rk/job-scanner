@@ -256,6 +256,15 @@ def pick_available_model(api_key: str, exclude: str = "") -> str | None:
     return flash[0] if flash else None
 
 
+# Gemini usage of the current run, written to the runs table (monitoring of cost and reliability)
+USAGE = {"gemini_calls": 0, "gemini_errors": 0, "tokens_in": 0, "tokens_out": 0}
+
+
+def _gemini_failed() -> None:
+    USAGE["gemini_errors"] += 1
+    return None
+
+
 def call_gemini(prompt: str, schema: dict, cfg: dict, api_key: str, temperature: float = 0.2) -> dict | None:
     """One structured-output call with retries, rate-limit back-off and model fallback.
     Returns the parsed JSON object, or None if every attempt failed."""
@@ -298,13 +307,17 @@ def call_gemini(prompt: str, schema: dict, cfg: dict, api_key: str, temperature:
                 continue
         if r.status_code != 200:
             print(f"  Gemini error {r.status_code}: {r.text[:200]}", file=sys.stderr)
-            return None
+            return _gemini_failed()
         try:
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
-        except (KeyError, IndexError, json.JSONDecodeError):
-            return None
-    return None
+            data = r.json()
+            usage = data.get("usageMetadata") or {}
+            USAGE["gemini_calls"] += 1
+            USAGE["tokens_in"] += int(usage.get("promptTokenCount") or 0)
+            USAGE["tokens_out"] += int(usage.get("candidatesTokenCount") or 0) + int(usage.get("thoughtsTokenCount") or 0)
+            return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+        except (KeyError, IndexError, ValueError, TypeError):
+            return _gemini_failed()
+    return _gemini_failed()
 
 
 TRIAGE_PROMPT = """You pre-screen job offers for the candidate below before a detailed review.
@@ -516,14 +529,19 @@ def main() -> None:
         if migrated:
             print(f"Migrated {migrated} ids from seen.json into the database")
     stats = {"started_at": now_iso()}
+    USAGE.update(gemini_calls=0, gemini_errors=0, tokens_in=0, tokens_out=0)
+    t0 = time.monotonic()
+    budget = float(cfg.get("time_budget_minutes", 40)) * 60  # leave time for e-mails, report and saving the cache
 
     expired = store.expire_queue(int(cfg.get("queue_max_age_days", 7)))
     backlog = store.queued()  # offers left over from earlier runs go first
     new = fetch_offers(cfg, set() if ignore_seen else store.seen_ids(),
                        set() if ignore_seen else store.recent_fingerprints(), stats)
+    t_search = time.monotonic()
     backlog_ids = {o["id"] for o in backlog}
     new = [o for o in new if o["id"] not in backlog_ids]
     new, triaged_out = triage_offers(new, profile, cfg, api_key)
+    t_triage = time.monotonic()
     store.save_triaged(triaged_out)  # kept for review; marked as seen so they are not triaged again
     if cfg.get("triage", True):
         print(f"AI pre-filter: kept {len(new)}, dropped {len(triaged_out)}")
@@ -534,8 +552,14 @@ def main() -> None:
     print(f"From queue: {len(backlog)}, new: {len(new)}, scoring now: {len(offers)}, "
           f"queued for next run: {len(overflow)}, expired from queue: {expired}")
 
-    results, failed = [], 0
+    results, failed, stopped_by_time = [], 0, 0
+    detail_failed: dict[str, int] = {}
     for i, o in enumerate(offers, 1):
+        if time.monotonic() - t0 > budget:
+            store.enqueue(offers[i - 1:])  # the rest waits for the next run instead of risking the job timeout
+            stopped_by_time = len(offers) - i + 1
+            print(f"Time budget of {budget / 60:.0f} min reached - {stopped_by_time} offers moved to the queue")
+            break
         src = sources.ALL.get(o.get("source") or "linkedin", sources.linkedin)
         try:
             desc = src.detail(o)
@@ -544,6 +568,7 @@ def main() -> None:
         if desc is None:  # network problem / rate limit - try again next run
             store.queue_failed(o)
             failed += 1
+            detail_failed[src.NAME] = detail_failed.get(src.NAME, 0) + 1
             continue
         if not desc:  # offer removed or no description - nothing to score
             store.dequeue(o["id"])
@@ -562,6 +587,18 @@ def main() -> None:
             failed += 1
         time.sleep(6)  # stay under the free-tier requests-per-minute limit
     waiting = store.queue_size()
+    t_score = time.monotonic()
+    timing = {"search_seconds": round(t_search - t0), "triage_seconds": round(t_triage - t_search),
+              "score_seconds": round(t_score - t_triage)}
+    if stats.get("sources"):  # add description-fetch failures to the per-portal stats
+        per = json.loads(stats["sources"])
+        for name, n in detail_failed.items():
+            per.setdefault(name, {})["detail_failed"] = n
+        stats["sources"] = json.dumps(per)
+    print(f"Gemini: {USAGE['gemini_calls']} calls, {USAGE['gemini_errors']} failed, "
+          f"{USAGE['tokens_in']:,} tokens in / {USAGE['tokens_out']:,} out; "
+          f"search {timing['search_seconds']}s, pre-filter {timing['triage_seconds']}s, "
+          f"scoring {timing['score_seconds']}s")
 
     good = sorted((r for r in results if r["score"] >= cfg["min_score_to_notify"]),
                   key=lambda r: r["score"], reverse=True)
@@ -604,7 +641,8 @@ def main() -> None:
 
     store.save_run({**stats, "finished_at": now_iso(), "scored": len(results), "failed": failed,
                     "notified": len(good), "model": cfg["gemini_model"],
-                    "queued": waiting, "queue_expired": expired, "triaged_out": len(triaged_out)})
+                    "queued": waiting, "queue_expired": expired, "triaged_out": len(triaged_out),
+                    "stopped_by_time": stopped_by_time, **timing, **USAGE})
     close_db(store)
 
 

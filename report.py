@@ -94,6 +94,48 @@ def _pct(part: int, whole: int) -> int:
 
 
 # ---------------------------------------------------------------- stats
+def _health(store, start: datetime, now: datetime) -> dict | None:
+    """Reliability and cost of the scanner runs in the period (from the runs table)."""
+    cols = {r[1] for r in store.con.execute("PRAGMA table_info(runs)")}
+    if "gemini_calls" not in cols:
+        return None
+    runs = [dict(r) for r in store.con.execute(
+        "SELECT * FROM runs WHERE started_at >= ? AND started_at < ?", (start.isoformat(), now.isoformat()))]
+    if not runs:
+        return None
+
+    def total(k):
+        return sum(r.get(k) or 0 for r in runs)
+
+    def minutes(r):
+        try:
+            return (datetime.fromisoformat(r["finished_at"]) - datetime.fromisoformat(r["started_at"])).total_seconds() / 60
+        except (TypeError, ValueError):
+            return None
+    durations = [m for m in (minutes(r) for r in runs) if m is not None]
+    portals: dict[str, dict] = defaultdict(lambda: {"cards": 0, "new": 0, "detail_failed": 0, "zero_runs": 0})
+    for r in runs:
+        for name, st in (json.loads(r["sources"]) if r.get("sources") else {}).items():
+            p = portals[name]
+            p["cards"] += st.get("cards", 0)
+            p["new"] += st.get("new", 0)
+            p["detail_failed"] += st.get("detail_failed", 0)
+            p["zero_runs"] += int(not st.get("cards"))
+    return {
+        "runs": len(runs),
+        "avg_minutes": round(statistics.mean(durations), 1) if durations else None,
+        "max_minutes": round(max(durations), 1) if durations else None,
+        "stopped_by_time": sum(bool(r.get("stopped_by_time")) for r in runs),
+        "gemini_calls": total("gemini_calls"), "gemini_errors": total("gemini_errors"),
+        "tokens_in": total("tokens_in"), "tokens_out": total("tokens_out"),
+        "scored": total("scored"), "failed": total("failed"),
+        "avg_search_s": round(total("search_seconds") / len(runs)),
+        "avg_triage_s": round(total("triage_seconds") / len(runs)),
+        "avg_score_s": round(total("score_seconds") / len(runs)),
+        "portals": dict(portals),
+    }
+
+
 def compute_stats(store, threshold: int, days: int = 7, now: datetime | None = None,
                   near_miss_band: int = 20) -> dict:
     now = now or datetime.now(timezone.utc)
@@ -143,6 +185,8 @@ def compute_stats(store, threshold: int, days: int = 7, now: datetime | None = N
 
     triaged = store.triaged_since(start.isoformat()) if hasattr(store, "triaged_since") else []
 
+    health = _health(store, start, now)
+
     verdicts = Counter(r["verdict"] for r in week)
     return {
         "period_start": start.date().isoformat(), "period_end": now.date().isoformat(),
@@ -161,6 +205,7 @@ def compute_stats(store, threshold: int, days: int = 7, now: datetime | None = N
         "categories": categories,
         "sources": portals,
         "triaged_out": len(triaged),
+        "health": health,
         "triaged_sample": [f"{t['title']} · {t['company']}" for t in triaged[-12:]],
         "best_offers": [{"title": r["title"], "company": r["company"], "score": r["score"], "url": r["url"]}
                         for r in sorted(week, key=lambda r: -(r["score"] or 0))[:5]],
@@ -171,7 +216,7 @@ def ai_recommendations(stats: dict, profile: str, call: Callable[..., dict | Non
     """`call` is scanner.call_gemini bound to cfg/api key: call(prompt, schema) -> dict | None."""
     if stats["offers"] < MIN_OFFERS_FOR_AI:
         return None
-    data = {k: v for k, v in stats.items() if k not in ("best_offers", "triaged_sample")}  # no URLs/company names needed
+    data = {k: v for k, v in stats.items() if k not in ("best_offers", "triaged_sample", "health")}  # no URLs/company names needed
     prompt = (f"{RECS_PROMPT}\n\n### Candidate profile\n{profile}\n\n"
               f"### Last week's statistics (JSON)\n{json.dumps(data, ensure_ascii=False, indent=1)}")
     recs = call(prompt, RECS_SCHEMA)
@@ -300,6 +345,28 @@ def build_report_html(stats: dict, recs: dict | None = None, csv_attached: bool 
                    f"color:#57606a;font-size:13px'>")
         out += [f"<li>{e(x)}</li>" for x in stats["triaged_sample"]]
         out.append("</ul>")
+
+    h = stats.get("health")
+    if h:
+        out.append(f"<h2 {h2}>System health</h2><table style='border-collapse:collapse;font-size:13px'>")
+        rows = [
+            ("runs", f"{h['runs']} (avg {h['avg_minutes']} min, longest {h['max_minutes']} min)"),
+            ("stopped by time budget", f"{h['stopped_by_time']} run(s)"),
+            ("avg stage time", f"search {h['avg_search_s']}s · pre-filter {h['avg_triage_s']}s · scoring {h['avg_score_s']}s"),
+            ("Gemini", f"{h['gemini_calls']} calls, {h['gemini_errors']} failed · "
+                       f"{h['tokens_in']:,} tokens in / {h['tokens_out']:,} out".replace(",", " ")),
+            ("offers scored / failed", f"{h['scored']} / {h['failed']}"),
+        ]
+        out += [f"<tr><td {td}><span style='color:#57606a'>{k}</span></td><td {td}>{e(v)}</td></tr>" for k, v in rows]
+        out.append("</table>")
+        if h["portals"]:
+            out.append(f"<table style='border-collapse:collapse;font-size:13px;margin-top:8px'><tr><th {th}>portal</th>"
+                       f"<th {th}>found</th><th {th}>new</th><th {th}>description errors</th><th {th}>runs with 0 found</th></tr>")
+            for name, p in sorted(h["portals"].items(), key=lambda kv: -kv[1]["cards"]):
+                warn = " style='color:#cf222e;font-weight:bold'" if p["zero_runs"] else ""
+                out.append(f"<tr><td {td}>{e(name)}</td><td {td}>{p['cards']}</td><td {td}>{p['new']}</td>"
+                           f"<td {td}>{p['detail_failed']}</td><td {td}><span{warn}>{p['zero_runs']}</span></td></tr>")
+            out.append("</table>")
 
     foot = f"{stats['offers_total']} offers in the database."
     if csv_attached:

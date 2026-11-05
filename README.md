@@ -18,7 +18,9 @@ A small automation that finds fresh job offers and scores them against my profil
 6. **Every** scored offer – not only the good ones – is saved to `data/jobs.db` (SQLite), together with a compressed copy of the description for later re-scoring/evaluation. Each run is logged too (searches, offers found, filtered, scored, failed).
 7. Offers above the threshold are e-mailed as an HTML digest, best first. On Mondays (configurable) the full dataset is attached as `jobs.csv`.
 8. Once a week (Monday by default) a **market & skill-gap report** is e-mailed – see below.
-9. If the portals return 0 offers across all searches, the e-mail carries a warning – that usually means the page layout changed or the request was blocked, not that there are no jobs.
+9. **Time budget:** after `time_budget_minutes` (40) the scanner stops scoring and queues the rest, so a slow day never runs into the 60-minute job timeout (a timed-out job would save nothing).
+10. **Monitoring:** every run records Gemini calls, failed calls, input/output tokens, time per stage (search, pre-filter, scoring) and per-portal results including description-fetch errors.
+11. If the portals return 0 offers across all searches, the e-mail carries a warning – that usually means the page layout changed or the request was blocked, not that there are no jobs.
 
 ## Weekly market & skill-gap report
 All numbers are computed in Python straight from the database; the LLM only receives the aggregates and turns them into at most three learning recommendations, so it cannot invent counts.
@@ -29,6 +31,7 @@ All numbers are computed in Python straight from the database; the LLM only rece
 - most required tools, and in how many of those offers the tool was the candidate's gap;
 - categories with average score and median salary (PLN/month), work-mode split, results per portal, best offers of the week;
 - offers skipped by the AI pre-filter (count and the latest titles);
+- **system health**: runs, average/longest duration, runs stopped by the time budget, Gemini calls/errors/tokens, average time per stage and per-portal results (found, new, description errors, runs with 0 found).
 - up to 3 recommendations from Gemini (skill, why – citing the numbers, first step this week); skipped when fewer than 10 offers were scored.
 
 Gap names are merged case-insensitively. On report days the CSV is attached to the report instead of the daily digest.
@@ -37,7 +40,7 @@ Gap names are merged case-insensitively. On report days the CSV is attached to t
 | table | one row per | main columns |
 |---|---|---|
 | `offers` | scored offer | title, company, location, score, verdict, gaps, role_category, work_mode, salary_min/max_pln_month, required_tools, english_level, notified, user_label, status |
-| `runs` | scanner run | started/finished, searches, cards found, dropped by title, scored, failed, notified, queued, model |
+| `runs` | scanner run | started/finished, searches, cards found, dropped by title, pre-filtered, scored, failed, notified, queued, stopped by time, stage seconds, Gemini calls/errors/tokens, per-portal stats (JSON), model |
 | `queue` | offer waiting to be scored | offer details, queued at, failed attempts |
 
 List fields (gaps, tools, contract types) are exported to CSV joined with ` | ` – in Power Query use *Split column → By delimiter → Rows* to count e.g. the most common gaps.
