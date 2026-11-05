@@ -250,6 +250,12 @@ class Store:
         return zlib.decompress(r[0]).decode("utf-8") if r and r[0] else ""
 
     # ------------------------------------------------------------ runs
+    def ran_today(self) -> bool:
+        """True if a run finished today (UTC) - used to skip the backup schedule."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        return bool(self.con.execute(
+            "SELECT 1 FROM runs WHERE finished_at >= ? LIMIT 1", (today,)).fetchone())
+
     def save_run(self, stats: dict) -> None:
         cols = ", ".join(stats)
         marks = ", ".join("?" for _ in stats)

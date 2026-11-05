@@ -3,7 +3,7 @@
 A small automation that finds fresh job offers and scores them against my profile with an LLM, so every morning I only read the offers worth applying to. Every scored offer is also stored, so over time the scanner builds a dataset of the job market I'm targeting.
 
 **Pipeline:** LinkedIn + pracuj.pl + No Fluff Jobs + justjoin.it + RocketJobs → title filter → cross-portal de-duplication → Google Gemini (structured JSON: fit score + extracted facts) → SQLite → daily HTML e-mail + weekly market & skill-gap report (with CSV export for Power BI)
-**Runs:** every weekday on GitHub Actions (free), no server needed.
+**Runs:** every weekday on GitHub Actions (free), no server needed – a main schedule off the full hour plus a backup schedule that only runs if the main one was dropped (GitHub sometimes skips scheduled runs).
 
 ## How it works
 1. `scanner.py` pulls offers posted in the last 24 h for the searches in `config.yaml` from every portal listed under `sources` (one module per portal in `sources/`: LinkedIn's public job search, the JSON pracuj.pl embeds in its pages, the No Fluff Jobs API and the API shared by justjoin.it and its non-IT sister site RocketJobs). A portal that fails doesn't stop the others – the e-mail says which one broke.

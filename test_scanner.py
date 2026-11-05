@@ -656,3 +656,20 @@ class BudgetAndMonitoringTests(unittest.TestCase):
             per = json.loads(store.con.execute("SELECT sources FROM runs").fetchone()[0])
             store.close()
         self.assertEqual(per["linkedin"]["detail_failed"], 1)
+
+
+class BackupScheduleTests(unittest.TestCase):
+    run_main = EndToEndTests.run_main
+
+    def test_backup_run_skips_when_main_ran_today(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            send = self.run_main(tmp, [], {"BACKUP_RUN": "true"})       # no run today yet -> works normally
+            self.assertEqual([r["id"] for r in send.call_args.args[0]], ["111"])
+            more = SEARCH_HTML.replace("111", "333").replace("Senior Data Analyst", "Data Analyst II")
+            send = self.run_main(tmp, [], {"BACKUP_RUN": "true"}, search_html=more)
+            send.assert_not_called()                                    # skipped: main run already done
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual(store.con.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)
+            store.close()
+            send = self.run_main(tmp, [], {"BACKUP_RUN": "false"}, search_html=more)  # a normal run still works
+            self.assertTrue(send.called)
