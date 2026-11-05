@@ -197,18 +197,18 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual([r[0] for r in run], [2, 1, 0])
             store.close()
 
-    def test_failed_scoring_is_retried_then_dropped(self):
+    def test_gemini_failure_keeps_offer_queued(self):
         def broken_gemini(*a, **k):
-            return mock.Mock(status_code=400, text="bad request")
+            r = mock.Mock(status_code=400, text="bad request")
+            r.json.return_value = {"error": {"status": "INVALID_ARGUMENT", "message": "bad"}}
+            return r
         with tempfile.TemporaryDirectory() as tmp:
-            for attempt in range(3):
-                self.run_main(tmp, [], {}, gemini=broken_gemini)
+            for _ in range(3):
+                send = self.run_main(tmp, [], {}, gemini=broken_gemini)
                 store = Store(Path(tmp) / "jobs.db")
-                self.assertEqual(store.queue_size(), 0 if attempt == 2 else 1)
+                self.assertEqual(store.queue_size(), 1)                     # never dropped - not the offer's fault
                 store.close()
-            store = Store(Path(tmp) / "jobs.db")
-            self.assertIn("111", store.seen_ids())                     # given up, not retried forever
-            store.close()
+            self.assertIn("Gemini was unavailable", send.call_args.args[2])  # the digest explains it
 
     def test_removed_offer_leaves_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -259,7 +259,7 @@ class PrivateConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PRIVATE_CONFIG": private}):
             cfg = scanner.load_config()
         self.assertEqual(cfg["keywords"], ["secret role"])
-        self.assertIn("gemini_model", cfg)                              # public keys kept
+        self.assertIn("gemini_models", cfg)                             # public keys kept
         enum = scanner.build_schema(cfg)["properties"]["role_category"]["enum"]
         self.assertEqual(enum, ["alpha", "beta", "other"])
         self.assertEqual(scanner.SCHEMA["properties"]["role_category"]["enum"],
@@ -711,3 +711,76 @@ class AlwaysEmailAndSundayReportTests(unittest.TestCase):
             store.close()
             self.run_main(tmp, [], {"REPORT_ONLY": "true", "BACKUP_RUN": "true"})
             self.assertFalse(self.weekly.called)                          # backup: already sent today
+
+
+class GeminiFallbackTests(unittest.TestCase):
+    def setUp(self):
+        scanner.DEAD_MODELS.clear()
+        scanner.USAGE.update(gemini_calls=0, gemini_errors=0, tokens_in=0, tokens_out=0)
+
+    def resp(self, code, status="", message="", quota="", delay=None):
+        r = mock.Mock(status_code=code, text=message)
+        details = [{"violations": [{"quotaId": quota}]}] if quota else []
+        if delay:
+            details.append({"retryDelay": f"{delay}s"})
+        r.json.return_value = {"error": {"status": status, "message": message, "details": details}}
+        return r
+
+    def test_overloaded_model_rotates_to_next(self):
+        calls = []
+        def post(url, **kw):
+            calls.append(url.split("/models/")[1].split(":")[0])
+            return self.resp(503, "UNAVAILABLE", "high demand") if len(calls) == 1 else fake_gemini()
+        cfg = {"gemini_models": ["a-lite", "b-lite"]}
+        with mock.patch.object(scanner.requests, "post", side_effect=post), mock.patch("time.sleep"):
+            self.assertEqual(scanner.call_gemini("p", {}, cfg, "k")["score"], 82)
+        self.assertEqual(calls, ["a-lite", "b-lite"])
+        self.assertEqual(cfg["_last_model"], "b-lite")
+        self.assertEqual(scanner.DEAD_MODELS, set())                     # overload is temporary
+
+    def test_daily_quota_drops_model_for_the_run(self):
+        calls = []
+        def post(url, **kw):
+            m = url.split("/models/")[1].split(":")[0]
+            calls.append(m)
+            if m == "a-lite":
+                return self.resp(429, "RESOURCE_EXHAUSTED", "quota", "GenerateRequestsPerDayPerProjectPerModel-FreeTier", 64000)
+            return fake_gemini()
+        cfg = {"gemini_models": ["a-lite", "b-lite"]}
+        with mock.patch.object(scanner.requests, "post", side_effect=post), mock.patch("time.sleep") as sleep:
+            scanner.call_gemini("p", {}, cfg, "k")
+            scanner.call_gemini("p", {}, cfg, "k")
+        self.assertEqual(calls, ["a-lite", "b-lite", "b-lite"])          # a-lite not asked again
+        self.assertIn("a-lite", scanner.DEAD_MODELS)
+        sleep.assert_not_called()                                         # no pointless 64000 s waits
+
+    def test_per_minute_quota_waits_bounded(self):
+        seq = [self.resp(429, "RESOURCE_EXHAUSTED", "rpm", "GenerateRequestsPerMinutePerProjectPerModel", 300), fake_gemini()]
+        with mock.patch.object(scanner.requests, "post", side_effect=seq), mock.patch("time.sleep") as sleep:
+            scanner.call_gemini("p", {}, {"gemini_models": ["a-lite"]}, "k")
+        sleep.assert_called_once_with(60)
+
+    def test_fallback_list_never_picks_non_lite(self):
+        r = mock.Mock(status_code=200)
+        r.json.return_value = {"models": [{"name": f"models/{n}", "supportedGenerationMethods": ["generateContent"]}
+                                          for n in ("gemini-flash-latest", "gemini-3.8-flash", "gemini-3.5-flash-lite",
+                                                    "gemini-3.1-flash-lite", "gemini-3.9-flash-lite-preview")]}
+        with mock.patch.object(scanner.requests, "get", return_value=r):
+            self.assertEqual(scanner.pick_available_model("k"), "gemini-3.5-flash-lite")
+
+    def test_circuit_breaker_stops_early(self):
+        cards = "".join(f'''<div class="base-card" data-entity-urn="urn:li:jobPosting:{i}">
+            <h3 class="base-search-card__title">Analyst {i}</h3><h4 class="base-search-card__subtitle">C{i}</h4>
+            <span class="job-search-card__location">L</span></div>''' for i in range(1, 9))
+        posts = []
+        def down(*a, **k):
+            posts.append(1)
+            return self.resp(503, "UNAVAILABLE", "high demand")
+        with tempfile.TemporaryDirectory() as tmp:
+            send = EndToEndTests.run_main(self, tmp, [], {}, search_html=cards, gemini=down,
+                                          max_gemini_failures_in_row=2, triage=False)
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual(store.queue_size(), 8)                       # nothing lost
+            store.close()
+        self.assertLessEqual(len(posts), 2 * 6)                          # stopped after 2 offers, not 8
+        self.assertIn("Gemini was unavailable", send.call_args.args[2])
