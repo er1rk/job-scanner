@@ -528,6 +528,10 @@ def main() -> None:
         migrated = store.import_legacy_seen(SEEN_FILE)
         if migrated:
             print(f"Migrated {migrated} ids from seen.json into the database")
+    if os.getenv("BACKUP_RUN", "").lower() == "true" and store.ran_today():
+        print("Today's main run already happened - backup run skipped")
+        close_db(store)
+        return
     stats = {"started_at": now_iso()}
     USAGE.update(gemini_calls=0, gemini_errors=0, tokens_in=0, tokens_out=0)
     t0 = time.monotonic()

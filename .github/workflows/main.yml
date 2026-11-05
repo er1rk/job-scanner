@@ -1,8 +1,11 @@
 name: Daily job scan
 
 on:
+  # GitHub delays or silently drops scheduled runs, especially at the top of the hour.
+  # Main run off the full hour + a backup run that does nothing if the main one already ran that day.
   schedule:
-    - cron: "0 7 * * 1-5"   # Mon–Fri 07:00 UTC (08:00 Warsaw in winter, 09:00 in summer)
+    - cron: "23 6 * * 1-5"   # main:   Mon–Fri 06:23 UTC (07:23 Warsaw in winter, 08:23 in summer)
+    - cron: "47 8 * * 1-5"   # backup: Mon–Fri 08:47 UTC - skipped if today's main run happened
   workflow_dispatch:         # "Run workflow" button for manual runs
     inputs:
       hours:
@@ -70,4 +73,5 @@ jobs:
           IGNORE_SEEN: ${{ inputs.ignore_seen }}
           ATTACH_CSV: ${{ inputs.attach_csv }}
           SEND_REPORT: ${{ inputs.send_report }}
+          BACKUP_RUN: ${{ github.event.schedule == '47 8 * * 1-5' }}
         run: python scanner.py
