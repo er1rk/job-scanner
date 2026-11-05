@@ -156,6 +156,9 @@ Subtract points for excluding conditions (e.g. required degree/certificate the c
 required language they don't speak, far more years required). Do NOT penalise work mode (remote/hybrid/office).
 Never assume skills the profile does not state. Answer in English.
 
+one_line_reason: at most ~15 words, the main reason for the score; don't start with "The candidate".
+Strengths: at most 4, each a short phrase (max ~6 words).
+
 Write each gap as a short, reusable skill/requirement name (e.g. "SQL", "SAP", "German C1",
 "3+ years experience") so gaps can be counted across many offers.
 
@@ -426,77 +429,101 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
 
 
 # ---------------------------------------------------------------- E-mail
+def _chip(text: str) -> str:
+    return (f"<span style='display:inline-block;font-size:12px;line-height:16px;color:{report.INK2};background:#f1efeb;"
+            f"border-radius:10px;padding:3px 9px;margin:0 4px 4px 0;white-space:nowrap'>{html.escape(text)}</span>")
+
+
+def _offer_card(r: dict, threshold: int) -> str:
+    strong = r["score"] >= max(75, threshold)
+    col, label = ("#1a7f37", "Strong match") if strong else ("#9a6700", "Worth a look")
+    facts = [salary_label(r),
+             r.get("work_mode") if r.get("work_mode") not in (None, "unknown") else "",
+             ", ".join(r.get("contract_types") or []),
+             f"EN {r['english_level']}" if r.get("english_level") not in (None, "unknown", "none") else ""]
+    chips = "".join(_chip(f) for f in facts if f)
+    plus = "".join(f"<div style='margin:2px 0;padding-left:16px;text-indent:-16px'><span style='color:#1a7f37'>✓</span> {html.escape(x)}</div>"
+                   for x in (r.get("strengths") or [])[:4])
+    minus = "".join(f"<div style='margin:2px 0;padding-left:16px;text-indent:-16px'><span style='color:#b42318'>✗</span> {html.escape(x)}</div>"
+                    for x in (r.get("gaps") or [])[:4])
+    url = html.escape(r.get("url") or "")
+    where = " · ".join(html.escape(x) for x in (r.get("company"), r.get("location"), sources.label(r.get("source"))) if x)
+    return (
+        f"<tr><td style='padding:0 0 12px'><table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
+        f"style='background:#ffffff;border:1px solid {report.LINE};border-radius:10px'><tr><td style='padding:16px 18px'>"
+        f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0'><tr><td style='vertical-align:top'>"
+        f"<div style='font-size:12px;color:{col};font-weight:600'>{label}</div>"
+        f"<a href='{url}' style='font-size:16px;line-height:21px;font-weight:600;color:{report.INK};text-decoration:none'>"
+        f"{html.escape(r.get('title') or '')}</a>"
+        f"<div style='font-size:13px;color:{report.INK2};margin-top:2px'>{where}</div></td>"
+        f"<td style='vertical-align:top;width:60px;text-align:right'><div style='display:inline-block;width:50px;height:50px;"
+        f"line-height:50px;border-radius:25px;border:3px solid {col};font-size:18px;font-weight:700;color:{col};"
+        f"text-align:center'>{r['score']}</div></td></tr></table>"
+        + (f"<div style='margin-top:10px'>{chips}</div>" if chips else "")
+        + f"<div style='font-size:13px;line-height:19px;color:{report.INK};margin:6px 0 10px'>"
+          f"{html.escape(r.get('one_line_reason') or '')}</div>"
+          f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='font-size:13px;line-height:18px;"
+          f"color:{report.INK2}'><tr><td width='50%' style='vertical-align:top;padding-right:10px'>{plus}</td>"
+          f"<td width='50%' style='vertical-align:top'>{minus}</td></tr></table>"
+          f"<div style='margin-top:12px'><a href='{url}' style='display:inline-block;background:{report.ACCENT};color:#ffffff;"
+          f"font-size:13px;font-weight:600;text-decoration:none;border-radius:6px;padding:7px 14px'>View offer</a></div>"
+          f"</td></tr></table></td></tr>")
+
+
 def build_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0,
-                triaged_out: int = 0, scored: int | None = None) -> str:
-    """HTML body of the digest (kept separate from sending so it can be previewed/tested)."""
-    colour = {"apply": "#1a7f37", "stretch": "#b08800", "skip": "#cf222e"}
-    rows = []
-    for r in results:
-        facts = " · ".join(x for x in (
-            salary_label(r),
-            r.get("work_mode") if r.get("work_mode") not in (None, "unknown") else "",
-            ", ".join(r.get("contract_types") or []),
-            f"EN {r['english_level']}" if r.get("english_level") not in (None, "unknown", "none") else "",
-        ) if x)
-        tools = ", ".join(r.get("required_tools") or [])
-        rows.append(f"""<tr>
-          <td style="padding:10px;font-size:20px;font-weight:bold;vertical-align:top;color:{colour.get(r['verdict'], '#333')}">{r['score']}</td>
-          <td style="padding:10px">
-            <a href="{html.escape(r['url'])}" style="font-weight:bold;font-size:15px">{html.escape(r['title'])}</a><br>
-            <span style="color:#555">{html.escape(r['company'])} · {html.escape(r['location'])} · <i>{html.escape(sources.label(r.get('source')))}</i></span><br>
-            {f'<span style="color:#333">{html.escape(facts)}</span><br>' if facts else ''}
-            {f'<span style="color:#555">Tools: {html.escape(tools)}</span><br>' if tools else ''}
-            <i>{html.escape(r['one_line_reason'])}</i><br>
-            <span style="color:#1a7f37">+ {html.escape('; '.join(r['strengths']))}</span><br>
-            <span style="color:#cf222e">− {html.escape('; '.join(r['gaps']))}</span>
-          </td></tr>""")
-    parts = []
-    if warning:
-        parts.append(f"<p style='background:#fff8c5;padding:10px;border-radius:6px'>⚠️ {html.escape(warning)}</p>")
+                triaged_out: int = 0, scored: int | None = None, threshold: int = 60) -> str:
+    """HTML body of the daily digest - e-mail-safe cards (kept separate from sending so it can be previewed/tested)."""
+    INK, INK2, MUTED, PAGE = report.INK, report.INK2, report.MUTED, report.PAGE
     if results:
-        parts.append(f"<h2>{len(results)} new matching offers</h2>"
-                     f"<table style='border-collapse:collapse;font-family:Arial,sans-serif'>{''.join(rows)}</table>")
+        title = f"{len(results)} new matching offer{'s' if len(results) != 1 else ''}"
     else:
-        done = f" {scored} new offers were scored, none reached the threshold." if scored is not None else ""
-        parts.append(f"<p>No new matches today.{done}</p>")
-    if triaged_out:
-        parts.append(f"<p style='color:#555'>The AI pre-filter skipped {triaged_out} clearly unrelated offers "
-                     f"(listed in the weekly report data).</p>")
+        title = "No new matches today"
+    sub = [f"{date.today():%A} {date.today().day} {date.today():%B}"]
+    if scored is not None:
+        sub.append(f"{scored} offers scored")
+    if results:
+        sub.append(f"best {results[0]['score']}/100")
+    blocks = []
+    if warning:
+        blocks.append(f"<tr><td style='padding:0 0 12px'><div style='background:#fff8c5;border:1px solid #eedc82;"
+                      f"border-radius:10px;padding:12px 16px;font-size:13px;line-height:19px;color:{INK}'>⚠️ "
+                      f"{html.escape(warning)}</div></td></tr>")
+    if results:
+        blocks += [_offer_card(r, threshold) for r in results]
+    else:
+        blocks.append(f"<tr><td style='padding:0 0 12px'><div style='background:#ffffff;border:1px solid {report.LINE};"
+                      f"border-radius:10px;padding:16px 18px;font-size:13px;line-height:19px;color:{INK2}'>Nothing reached "
+                      f"the threshold this time – the scanner ran normally.</div></td></tr>")
+    foot = []
     if waiting:
-        parts.append(f"<p style='color:#555'>{waiting} more offers are waiting in the queue and will be "
-                     f"scored on the next run(s).</p>")
+        foot.append(f"{waiting} offers waiting in the queue")
+    if triaged_out:
+        foot.append(f"AI pre-filter skipped {triaged_out} unrelated offers")
     if csv_text:
-        parts.append("<p style='color:#555'>Attached: <b>jobs.csv</b> - every scored offer so far "
-                     "(ready for Power BI / Excel).</p>")
-    return "<div style='font-family:Arial,sans-serif'>" + "".join(parts) + "</div>"
-
-
-def send_html(subject: str, body_html: str, csv_text: str | None = None) -> None:
-    sender, password = os.getenv("EMAIL_ADDRESS"), os.getenv("EMAIL_APP_PASSWORD")
-    if not (sender and password):
-        print("E-mail not configured - skipping notification")
-        return
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"], msg["To"] = sender, os.getenv("EMAIL_TO") or sender
-    msg.set_content("Open this e-mail in an HTML-capable client.")
-    msg.add_alternative(body_html, subtype="html")
-    if csv_text:
-        msg.add_attachment(csv_text.encode("utf-8"), maintype="text", subtype="csv",
-                           filename=f"jobs_{date.today():%Y-%m-%d}.csv")
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(sender, password)
-        smtp.send_message(msg)
-    print(f"E-mail sent: {subject.split(':')[0]}")
+        foot.append("full dataset attached as jobs.csv")
+    return (
+        f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+        f"<meta name='color-scheme' content='light only'><meta name='supported-color-schemes' content='light'></head>"
+        f"<body style='margin:0;padding:0;background:{PAGE}'><table role='presentation' width='100%' cellpadding='0' "
+        f"cellspacing='0' style='background:{PAGE}'><tr><td align='center' style='padding:24px 12px'>"
+        f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='max-width:640px;"
+        f"font-family:{report.FONT};color:{INK}'>"
+        f"<tr><td style='padding:0 2px 14px'><div style='font-size:12px;letter-spacing:.04em;text-transform:uppercase;"
+        f"color:{MUTED}'>Job scanner · daily digest</div><div style='font-size:22px;line-height:28px;font-weight:600;"
+        f"color:{INK};margin-top:2px'>{title}</div><div style='font-size:13px;color:{INK2};margin-top:2px'>"
+        f"{' · '.join(sub)}</div></td></tr>" + "".join(blocks)
+        + (f"<tr><td style='padding:6px 2px 0;font-size:12px;color:{MUTED};text-align:center'>{' · '.join(foot)}</td></tr>"
+           if foot else "")
+        + "</table></td></tr></table></body></html>")
 
 
 def send_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0,
-               triaged_out: int = 0, scored: int | None = None) -> None:
+               triaged_out: int = 0, scored: int | None = None, threshold: int = 60) -> None:
     if results:
         subject = f"Job scan {date.today():%d.%m}: {len(results)} offers, best {results[0]['score']}/100"
     else:
         subject = f"Job scan {date.today():%d.%m}: " + ("check the scraper" if warning else "no new matches")
-    send_html(subject, build_email(results, csv_text, warning, waiting, triaged_out, scored), csv_text)
+    send_html(subject, build_email(results, csv_text, warning, waiting, triaged_out, scored, threshold), csv_text)
 
 
 def send_weekly_report(store: Store, cfg: dict, profile: str | None, api_key: str | None,
@@ -713,7 +740,7 @@ def main() -> None:
     # By default a digest goes out after every run, even with no matches - so a missing e-mail always means
     # the run didn't happen (GitHub can drop scheduled runs) rather than "nothing new today".
     if good or digest_csv or warning or cfg.get("email_every_run", True):
-        send_email(good, digest_csv, warning, waiting, len(triaged_out), len(results))
+        send_email(good, digest_csv, warning, waiting, len(triaged_out), len(results), cfg["min_score_to_notify"])
         store.mark_notified([r["id"] for r in good])
     if report_due:
         send_weekly_report(store, cfg, profile, api_key, csv_text)

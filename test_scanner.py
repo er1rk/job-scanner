@@ -148,7 +148,8 @@ class EndToEndTests(unittest.TestCase):
     def test_full_run_saves_everything_and_dedupes(self):
         with tempfile.TemporaryDirectory() as tmp:
             send = self.run_main(tmp, [], {"ATTACH_CSV": "true"})
-            good, csv_text, warning, waiting, triaged, scored = send.call_args.args
+            good, csv_text, warning, waiting, triaged, scored, threshold = send.call_args.args
+            self.assertEqual(threshold, 60)
             self.assertEqual(scored, 1)
             self.assertEqual(triaged, 0)
             self.assertEqual(waiting, 0)
@@ -245,12 +246,22 @@ class EndToEndTests(unittest.TestCase):
             self.assertFalse((Path(tmp) / "jobs.db").exists())
 
     def test_email_html(self):
-        body = scanner.build_email([{"id": "1", "title": "A & B", "company": "C", "location": "L",
-                                     "url": "https://x", **GEMINI_RESULT}], "csv", "")
+        offer = {"id": "1", "title": "A & B", "company": "C", "location": "L", "url": "https://x", **GEMINI_RESULT}
+        body = scanner.build_email([offer], "csv", "", 3, 5, 120, 60)
         self.assertIn("A &amp; B", body)
-        self.assertIn("8 000–11 000 PLN / month gross · hybrid · employment contract · EN B2", body)
-        self.assertIn("jobs.csv", body)
-        self.assertIn("0 offers", scanner.build_email([], None, "found 0 offers"))
+        self.assertIn("1 new matching offer<", body)
+        self.assertIn("120 offers scored · best 82/100", body)
+        self.assertIn("Strong match", body)                                   # 82 >= 75
+        for chip in ("8 000–11 000 PLN / month gross", "hybrid", "employment contract", "EN B2"):
+            self.assertIn(f">{chip}</span>", body)
+        self.assertIn("✓</span> Power BI", body)
+        self.assertIn("✗</span> SQL", body)
+        self.assertEqual(body.count("href='https://x'"), 2)                     # title + View offer
+        self.assertIn("3 offers waiting in the queue · AI pre-filter skipped 5 unrelated offers · "
+                      "full dataset attached as jobs.csv", body)
+        lower = scanner.build_email([{**offer, "score": 64}], None, "", 0, 0, None, 60)
+        self.assertIn("Worth a look", lower)
+        self.assertIn("found 0 offers", scanner.build_email([], None, "found 0 offers"))
 
 
 class PrivateConfigTests(unittest.TestCase):
@@ -591,7 +602,7 @@ class MultiSourceRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(sources.pracuj, "search", side_effect=KeyError("layout changed")):
             send = self.run_main(tmp, [], {}, sources=["pracuj", "linkedin"])
-            good, _, warning, _, _, _ = send.call_args.args
+            good, _, warning, _, _, _, _ = send.call_args.args
             self.assertEqual([r["id"] for r in good], ["111"])
             self.assertIn("pracuj.pl", warning)
 
@@ -692,10 +703,12 @@ class AlwaysEmailAndSundayReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.run_main(tmp, [], {})
             send = self.run_main(tmp, [], {}, email_every_run=True)        # nothing new on the second run
-            good, _, warning, _, _, scored = send.call_args.args
+            good, _, warning, _, _, scored, _ = send.call_args.args
             self.assertEqual((good, warning, scored), ([], "", 0))
         body = scanner.build_email([], None, "", 0, 0, 37)
-        self.assertIn("No new matches today. 37 new offers were scored", body)
+        self.assertIn("No new matches today", body)
+        self.assertIn("37 offers scored", body)
+        self.assertIn("the scanner ran normally", body)
 
     def test_sunday_report_only_and_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
