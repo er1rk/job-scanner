@@ -640,7 +640,7 @@ class BudgetAndMonitoringTests(unittest.TestCase):
         self.assertIn("linkedin", h["portals"])
         html_out = report.build_report_html(stats)
         self.assertIn("System health", html_out)
-        self.assertIn("2 000 tokens in / 400 out", html_out)
+        self.assertIn("2\u202f000 tokens in / 400 out", html_out)
 
     def test_gemini_error_counted(self):
         scanner.USAGE.update(gemini_calls=0, gemini_errors=0, tokens_in=0, tokens_out=0)
@@ -648,6 +648,15 @@ class BudgetAndMonitoringTests(unittest.TestCase):
         with mock.patch.object(scanner.requests, "post", return_value=bad):
             self.assertIsNone(scanner.call_gemini("p", {}, {"gemini_model": "m"}, "k"))
         self.assertEqual((scanner.USAGE["gemini_calls"], scanner.USAGE["gemini_errors"]), (0, 1))
+
+    def test_unusable_answer_is_retried(self):
+        scanner.USAGE.update(gemini_calls=0, gemini_errors=0, tokens_in=0, tokens_out=0)
+        cut = mock.Mock(status_code=200)
+        cut.json.return_value = {"candidates": [{"finishReason": "MAX_TOKENS",
+                                                 "content": {"parts": [{"text": '{"keep": [1'}]}}]}
+        with mock.patch.object(scanner.requests, "post", side_effect=[cut, fake_gemini()]), mock.patch("time.sleep"):
+            self.assertEqual(scanner.call_gemini("p", {}, {"gemini_model": "m"}, "k")["score"], 82)
+        self.assertEqual(scanner.USAGE["gemini_errors"], 0)
 
     def test_detail_failures_counted_per_portal(self):
         with tempfile.TemporaryDirectory() as tmp:
