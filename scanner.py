@@ -385,7 +385,7 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
 
 # ---------------------------------------------------------------- E-mail
 def build_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0,
-                triaged_out: int = 0) -> str:
+                triaged_out: int = 0, scored: int | None = None) -> str:
     """HTML body of the digest (kept separate from sending so it can be previewed/tested)."""
     colour = {"apply": "#1a7f37", "stretch": "#b08800", "skip": "#cf222e"}
     rows = []
@@ -415,7 +415,8 @@ def build_email(results: list[dict], csv_text: str | None = None, warning: str =
         parts.append(f"<h2>{len(results)} new matching offers</h2>"
                      f"<table style='border-collapse:collapse;font-family:Arial,sans-serif'>{''.join(rows)}</table>")
     else:
-        parts.append("<p>No new offers above the threshold today.</p>")
+        done = f" {scored} new offers were scored, none reached the threshold." if scored is not None else ""
+        parts.append(f"<p>No new matches today.{done}</p>")
     if triaged_out:
         parts.append(f"<p style='color:#555'>The AI pre-filter skipped {triaged_out} clearly unrelated offers "
                      f"(listed in the weekly report data).</p>")
@@ -448,12 +449,12 @@ def send_html(subject: str, body_html: str, csv_text: str | None = None) -> None
 
 
 def send_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0,
-               triaged_out: int = 0) -> None:
+               triaged_out: int = 0, scored: int | None = None) -> None:
     if results:
         subject = f"Job scan {date.today():%d.%m}: {len(results)} offers, best {results[0]['score']}/100"
     else:
-        subject = f"Job scan {date.today():%d.%m}: " + ("check the scraper" if warning else "data export")
-    send_html(subject, build_email(results, csv_text, warning, waiting, triaged_out), csv_text)
+        subject = f"Job scan {date.today():%d.%m}: " + ("check the scraper" if warning else "no new matches")
+    send_html(subject, build_email(results, csv_text, warning, waiting, triaged_out, scored), csv_text)
 
 
 def send_weekly_report(store: Store, cfg: dict, profile: str | None, api_key: str | None,
@@ -536,7 +537,16 @@ def main() -> None:
         migrated = store.import_legacy_seen(SEEN_FILE)
         if migrated:
             print(f"Migrated {migrated} ids from seen.json into the database")
-    if os.getenv("BACKUP_RUN", "").lower() == "true" and store.ran_today():
+    backup = os.getenv("BACKUP_RUN", "").lower() == "true"
+    if os.getenv("REPORT_ONLY", "").lower() == "true":  # Sunday: weekly report from the database, no scanning
+        if backup and store.report_sent_today():
+            print("Today's weekly report was already sent - backup run skipped")
+        else:
+            send_weekly_report(store, cfg, profile, api_key, store.export_csv() if store.count() else None)
+            store.mark_report_sent()
+        close_db(store)
+        return
+    if backup and store.ran_today():
         print("Today's main run already happened - backup run skipped")
         close_db(store)
         return
@@ -645,8 +655,10 @@ def main() -> None:
     csv_text = store.export_csv() if attach and store.count() else None
     # On report days the CSV travels with the weekly report instead of the daily digest
     digest_csv = None if report_due else csv_text
-    if good or digest_csv or warning:
-        send_email(good, digest_csv, warning, waiting, len(triaged_out))
+    # By default a digest goes out after every run, even with no matches - so a missing e-mail always means
+    # the run didn't happen (GitHub can drop scheduled runs) rather than "nothing new today".
+    if good or digest_csv or warning or cfg.get("email_every_run", True):
+        send_email(good, digest_csv, warning, waiting, len(triaged_out), len(results))
         store.mark_notified([r["id"] for r in good])
     if report_due:
         send_weekly_report(store, cfg, profile, api_key, csv_text)
