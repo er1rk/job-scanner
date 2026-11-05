@@ -126,7 +126,10 @@ class Store:
         self.con.executescript(SCHEMA_SQL)
         # columns added after the first release (CREATE TABLE IF NOT EXISTS doesn't add them to old files)
         for table, cols in {"runs": {"queued": "INTEGER", "queue_expired": "INTEGER", "sources": "TEXT",
-                                     "triaged_out": "INTEGER"},
+                                     "triaged_out": "INTEGER", "stopped_by_time": "INTEGER",
+                                     "search_seconds": "INTEGER", "triage_seconds": "INTEGER",
+                                     "score_seconds": "INTEGER", "gemini_calls": "INTEGER",
+                                     "gemini_errors": "INTEGER", "tokens_in": "INTEGER", "tokens_out": "INTEGER"},
                             "offers": {"fingerprint": "TEXT"}}.items():
             have = {r[1] for r in self.con.execute(f"PRAGMA table_info({table})")}
             for col, typ in cols.items():

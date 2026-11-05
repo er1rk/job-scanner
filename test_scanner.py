@@ -41,7 +41,8 @@ GEMINI_RESULT = {
 
 def fake_gemini(*args, **kwargs):
     r = mock.Mock(status_code=200)
-    r.json.return_value = {"candidates": [{"content": {"parts": [{"text": json.dumps(GEMINI_RESULT)}]}}]}
+    r.json.return_value = {"candidates": [{"content": {"parts": [{"text": json.dumps(GEMINI_RESULT)}]}}],
+                           "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 200}}
     return r
 
 
@@ -605,3 +606,53 @@ class ReportTriageTests(unittest.TestCase):
         # an empty week still renders without the section; a week with offers shows it
         stats["offers"] = 1
         self.assertIn("Java Developer · X", report.build_report_html(stats))
+
+
+class BudgetAndMonitoringTests(unittest.TestCase):
+    run_main = EndToEndTests.run_main
+
+    def test_time_budget_moves_rest_to_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            send = self.run_main(tmp, [], {}, time_budget_minutes=0)
+            send.assert_not_called()                     # nothing scored (and no warning) -> no digest
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual((store.count(), store.queue_size()), (0, 1))
+            run = store.con.execute("SELECT stopped_by_time, scored FROM runs").fetchone()
+            self.assertEqual(tuple(run), (1, 0))
+            store.close()
+            send = self.run_main(tmp, [], {}, search_html="")  # next run (normal budget) scores the queued offer
+            self.assertEqual([r["id"] for r in send.call_args.args[0]], ["111"])
+
+    def test_usage_and_timing_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, [], {})
+            store = Store(Path(tmp) / "jobs.db")
+            r = dict(store.con.execute("SELECT * FROM runs").fetchone())
+            # 2 successful calls: pre-filter (no "keep" in the fake answer -> batch kept) + scoring
+            self.assertEqual((r["gemini_calls"], r["tokens_in"], r["tokens_out"]), (2, 2000, 400))
+            self.assertEqual(r["gemini_errors"], 0)
+            self.assertGreaterEqual(r["search_seconds"], 0)
+            self.assertEqual(r["stopped_by_time"], 0)
+            stats = report.compute_stats(store, threshold=60)
+            store.close()
+        h = stats["health"]
+        self.assertEqual((h["runs"], h["gemini_calls"], h["scored"]), (1, 2, 1))
+        self.assertIn("linkedin", h["portals"])
+        html_out = report.build_report_html(stats)
+        self.assertIn("System health", html_out)
+        self.assertIn("2 000 tokens in / 400 out", html_out)
+
+    def test_gemini_error_counted(self):
+        scanner.USAGE.update(gemini_calls=0, gemini_errors=0, tokens_in=0, tokens_out=0)
+        bad = mock.Mock(status_code=400, text="bad")
+        with mock.patch.object(scanner.requests, "post", return_value=bad):
+            self.assertIsNone(scanner.call_gemini("p", {}, {"gemini_model": "m"}, "k"))
+        self.assertEqual((scanner.USAGE["gemini_calls"], scanner.USAGE["gemini_errors"]), (0, 1))
+
+    def test_detail_failures_counted_per_portal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, [], {}, detail=lambda url: None)
+            store = Store(Path(tmp) / "jobs.db")
+            per = json.loads(store.con.execute("SELECT sources FROM runs").fetchone()[0])
+            store.close()
+        self.assertEqual(per["linkedin"]["detail_failed"], 1)

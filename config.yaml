@@ -48,6 +48,10 @@ triage_batch_size: 60
 # next run, so nothing is lost. ~150 offers take ~20 minutes and fit the free tier.
 max_offers_per_run: 150
 
+# Stop scoring after this many minutes and queue the rest, so a slow day never hits the 60-minute job
+# timeout (a timed-out job saves nothing). The weekly report shows how often this happens.
+time_budget_minutes: 40
+
 # Queued offers older than this are dropped (they are usually closed by then)
 queue_max_age_days: 7
 
