@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS triaged (             -- dropped by the AI pre-filter
     url        TEXT,
     triaged_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reports (             -- weekly reports sent (so a backup schedule doesn't send twice)
+    sent_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS seen (                -- ids skipped without scoring (e.g. empty description)
     id TEXT PRIMARY KEY
 );
@@ -255,6 +258,14 @@ class Store:
         today = datetime.now(timezone.utc).date().isoformat()
         return bool(self.con.execute(
             "SELECT 1 FROM runs WHERE finished_at >= ? LIMIT 1", (today,)).fetchone())
+
+    def report_sent_today(self) -> bool:
+        today = datetime.now(timezone.utc).date().isoformat()
+        return bool(self.con.execute("SELECT 1 FROM reports WHERE sent_at >= ? LIMIT 1", (today,)).fetchone())
+
+    def mark_report_sent(self) -> None:
+        self.con.execute("INSERT INTO reports(sent_at) VALUES (?)", (now_iso(),))
+        self.con.commit()
 
     def save_run(self, stats: dict) -> None:
         cols = ", ".join(stats)

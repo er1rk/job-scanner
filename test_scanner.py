@@ -123,7 +123,7 @@ class EndToEndTests(unittest.TestCase):
     def run_main(self, tmp, argv, env, search_html=SEARCH_HTML, detail=lambda url: DETAIL_HTML,
                  gemini=fake_gemini, **cfg_overrides):
         cfg = scanner.load_config()
-        cfg.update(attach_csv_weekdays=[], report_weekdays=[], sources=["linkedin"])
+        cfg.update(attach_csv_weekdays=[], report_weekdays=[], sources=["linkedin"], email_every_run=False)
         cfg.update(cfg_overrides)
 
         def fake_get(url, retries=3, **kwargs):
@@ -148,7 +148,8 @@ class EndToEndTests(unittest.TestCase):
     def test_full_run_saves_everything_and_dedupes(self):
         with tempfile.TemporaryDirectory() as tmp:
             send = self.run_main(tmp, [], {"ATTACH_CSV": "true"})
-            good, csv_text, warning, waiting, triaged = send.call_args.args
+            good, csv_text, warning, waiting, triaged, scored = send.call_args.args
+            self.assertEqual(scored, 1)
             self.assertEqual(triaged, 0)
             self.assertEqual(waiting, 0)
             self.assertEqual([r["id"] for r in good], ["111"])  # "Senior" offer dropped by title
@@ -563,7 +564,7 @@ class MultiSourceRunTests(unittest.TestCase):
             return PRACUJ_SEARCH if "pracuj" in url else linkedin_card
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(common, "get", side_effect=search_get):
             cfg = scanner.load_config()
-            cfg.update(attach_csv_weekdays=[], report_weekdays=[], sources=["linkedin", "pracuj"],
+            cfg.update(attach_csv_weekdays=[], report_weekdays=[], sources=["linkedin", "pracuj"], email_every_run=False,
                        include_title_keywords=["analyst", "analityk"], keywords=["data analyst"],
                        locations=["Warsaw, Poland"], include_remote_poland=False)
             with mock.patch.object(scanner, "DB_FILE", Path(tmp) / "jobs.db"), \
@@ -590,7 +591,7 @@ class MultiSourceRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(sources.pracuj, "search", side_effect=KeyError("layout changed")):
             send = self.run_main(tmp, [], {}, sources=["pracuj", "linkedin"])
-            good, _, warning, _, _ = send.call_args.args
+            good, _, warning, _, _, _ = send.call_args.args
             self.assertEqual([r["id"] for r in good], ["111"])
             self.assertIn("pracuj.pl", warning)
 
@@ -682,3 +683,31 @@ class BackupScheduleTests(unittest.TestCase):
             store.close()
             send = self.run_main(tmp, [], {"BACKUP_RUN": "false"}, search_html=more)  # a normal run still works
             self.assertTrue(send.called)
+
+
+class AlwaysEmailAndSundayReportTests(unittest.TestCase):
+    run_main = EndToEndTests.run_main
+
+    def test_digest_sent_even_without_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, [], {})
+            send = self.run_main(tmp, [], {}, email_every_run=True)        # nothing new on the second run
+            good, _, warning, _, _, scored = send.call_args.args
+            self.assertEqual((good, warning, scored), ([], "", 0))
+        body = scanner.build_email([], None, "", 0, 0, 37)
+        self.assertIn("No new matches today. 37 new offers were scored", body)
+
+    def test_sunday_report_only_and_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, [], {})                                    # some data in the database
+            send = self.run_main(tmp, [], {"REPORT_ONLY": "true"})
+            send.assert_not_called()                                      # no digest, no scanning
+            weekly = self.weekly
+            self.assertTrue(weekly.called)
+            self.assertIn("Data Analyst", weekly.call_args.args[4])       # CSV attached
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual(store.con.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)  # no scan run added
+            self.assertTrue(store.report_sent_today())
+            store.close()
+            self.run_main(tmp, [], {"REPORT_ONLY": "true", "BACKUP_RUN": "true"})
+            self.assertFalse(self.weekly.called)                          # backup: already sent today

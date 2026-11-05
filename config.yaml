@@ -72,9 +72,14 @@ fx_to_pln:
   GBP: 4.95
   CHF: 4.55
 
-# Attach the full dataset (jobs.csv) to the e-mail on these weekdays (0 = Monday ... 6 = Sunday)
-attach_csv_weekdays: [0]
+# Attach the full dataset (jobs.csv) to the daily digest on these weekdays (0 = Monday ... 6 = Sunday).
+# The Sunday weekly report always carries it, so this is empty by default.
+attach_csv_weekdays: []
 
-# Send the weekly market & skill-gap report on these weekdays (0 = Monday). It covers the last 7 days
-# and carries the CSV attachment on that day.
-report_weekdays: [0]
+# The weekly report has its own Sunday schedule (see the workflow). List weekdays here to ALSO send it
+# with a daily scan (0 = Monday).
+report_weekdays: []
+
+# Send a digest after every daily run, even with no matches - a missing e-mail then always means the run
+# didn't happen. Set to false to get e-mails only when there is something above the threshold.
+email_every_run: true

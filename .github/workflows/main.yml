@@ -6,6 +6,8 @@ on:
   schedule:
     - cron: "23 6 * * 1-5"   # main:   Mon–Fri 06:23 UTC (07:23 Warsaw in winter, 08:23 in summer)
     - cron: "47 8 * * 1-5"   # backup: Mon–Fri 08:47 UTC - skipped if today's main run happened
+    - cron: "13 8 * * 0"     # Sunday weekly report: 08:13 UTC (09:13 Warsaw in winter) - no scanning
+    - cron: "41 10 * * 0"    # Sunday backup: skipped if the report was already sent
   workflow_dispatch:         # "Run workflow" button for manual runs
     inputs:
       hours:
@@ -73,5 +75,6 @@ jobs:
           IGNORE_SEEN: ${{ inputs.ignore_seen }}
           ATTACH_CSV: ${{ inputs.attach_csv }}
           SEND_REPORT: ${{ inputs.send_report }}
-          BACKUP_RUN: ${{ github.event.schedule == '47 8 * * 1-5' }}
+          BACKUP_RUN: ${{ github.event.schedule == '47 8 * * 1-5' || github.event.schedule == '41 10 * * 0' }}
+          REPORT_ONLY: ${{ github.event.schedule == '13 8 * * 0' || github.event.schedule == '41 10 * * 0' }}
         run: python scanner.py

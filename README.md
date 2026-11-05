@@ -3,7 +3,7 @@
 A small automation that finds fresh job offers and scores them against my profile with an LLM, so every morning I only read the offers worth applying to. Every scored offer is also stored, so over time the scanner builds a dataset of the job market I'm targeting.
 
 **Pipeline:** LinkedIn + pracuj.pl + No Fluff Jobs + justjoin.it + RocketJobs → title filter → cross-portal de-duplication → Google Gemini (structured JSON: fit score + extracted facts) → SQLite → daily HTML e-mail + weekly market & skill-gap report (with CSV export for Power BI)
-**Runs:** every weekday on GitHub Actions (free), no server needed – a main schedule off the full hour plus a backup schedule that only runs if the main one was dropped (GitHub sometimes skips scheduled runs).
+**Runs:** scans every weekday, weekly report on Sunday – on GitHub Actions (free), no server needed – a main schedule off the full hour plus a backup schedule that only runs if the main one was dropped (GitHub sometimes skips scheduled runs).
 
 ## How it works
 1. `scanner.py` pulls offers posted in the last 24 h for the searches in `config.yaml` from every portal listed under `sources` (one module per portal in `sources/`: LinkedIn's public job search, the JSON pracuj.pl embeds in its pages, the No Fluff Jobs API and the API shared by justjoin.it and its non-IT sister site RocketJobs). A portal that fails doesn't stop the others – the e-mail says which one broke.
@@ -16,8 +16,8 @@ A small automation that finds fresh job offers and scores them against my profil
    - **facts about the offer** – role category, industry, work mode, contract types, salary range (currency, period, gross/net), years required, English level, whether Polish is required, required and nice-to-have tools.
 5. Salaries are normalised to **PLN per month** (`fx_to_pln` in `config.yaml`), so offers can be compared.
 6. **Every** scored offer – not only the good ones – is saved to `data/jobs.db` (SQLite), together with a compressed copy of the description for later re-scoring/evaluation. Each run is logged too (searches, offers found, filtered, scored, failed).
-7. Offers above the threshold are e-mailed as an HTML digest, best first. On Mondays (configurable) the full dataset is attached as `jobs.csv`.
-8. Once a week (Monday by default) a **market & skill-gap report** is e-mailed – see below.
+7. Offers above the threshold are e-mailed as an HTML digest, best first. A digest goes out after every run, even with no matches (`email_every_run`), so a missing e-mail always means the run didn't happen.
+8. Every **Sunday** morning a separate schedule (with its own backup) sends the **market & skill-gap report** for the past 7 days, with the full dataset attached as `jobs.csv` – no scanning on that run. See below.
 9. **Time budget:** after `time_budget_minutes` (40) the scanner stops scoring and queues the rest, so a slow day never runs into the 60-minute job timeout (a timed-out job would save nothing).
 10. **Monitoring:** every run records Gemini calls, failed calls, input/output tokens, time per stage (search, pre-filter, scoring) and per-portal results including description-fetch errors.
 11. If the portals return 0 offers across all searches, the e-mail carries a warning – that usually means the page layout changed or the request was blocked, not that there are no jobs.
