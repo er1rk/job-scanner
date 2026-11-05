@@ -2,6 +2,29 @@
 
 A small automation that finds fresh job offers and scores them against my profile with an LLM, so every morning I only read the offers worth applying to. Every scored offer is also stored, so over time the scanner builds a dataset of the job market I'm targeting.
 
+## Highlights
+- **5 portals, ~2,000 listings a day**, merged and de-duplicated across portals
+- **Two-stage LLM workflow** – a cheap batch pre-filter on titles, then detailed scoring with a fixed rubric and a JSON schema (15 extracted fields, salary normalised to PLN/month)
+- **A dataset, not just alerts** – every scored offer is stored; a weekly report shows the skills that block near-miss offers, the most required tools and salary medians
+- **Runs unattended** – backup schedules, a queue, a time budget, model fallback with a circuit breaker, monitoring of tokens and stage times, 52 automated tests
+- **Public repo, private data** – profile, keys and search settings in GitHub Secrets; the database is encrypted
+
+## Architecture
+```mermaid
+flowchart LR
+    subgraph SRC["5 job portals"]
+        direction TB
+        L[LinkedIn] ~~~ P[pracuj.pl] ~~~ N[No Fluff Jobs] ~~~ J[justjoin.it] ~~~ R[RocketJobs]
+    end
+    SRC -->|"~2,000 listings / day"| F["Title filter +<br/>cross-portal de-dup"]
+    F --> T["Gemini pre-filter<br/>60 titles per call"]
+    T -->|"~30–50% kept"| Q[("Queue<br/>max 150 / run")]
+    Q --> S["Gemini scoring<br/>rubric + JSON schema<br/>15 extracted fields"]
+    S --> DB[("SQLite<br/>encrypted cache")]
+    DB --> D["Daily digest<br/>e-mail"]
+    DB --> W["Sunday report<br/>skill gaps · CSV"]
+```
+
 **Pipeline:** LinkedIn + pracuj.pl + No Fluff Jobs + justjoin.it + RocketJobs → title filter → cross-portal de-duplication → Google Gemini (structured JSON: fit score + extracted facts) → SQLite → daily HTML e-mail + weekly market & skill-gap report (with CSV export for Power BI)
 **Runs:** scans every weekday, weekly report on Sunday – on GitHub Actions (free), no server needed – a main schedule off the full hour plus a backup schedule that only runs if the main one was dropped (GitHub sometimes skips scheduled runs).
 
