@@ -60,6 +60,17 @@ def _clean(label: str) -> str:
     return label
 
 
+ALIASES = {"powerbi": "power bi", "ms power bi": "power bi", "excel ms": "excel", "advanced excel": "excel",
+           "sql server": "sql server", "ms sql": "sql server", "t-sql": "sql", "mysql": "mysql"}
+
+
+def _key(label: str) -> str:
+    """Comparable form: case-insensitive, 'MS Excel' / 'Microsoft Excel' -> 'excel'."""
+    k = _clean(label).casefold()
+    k = re.sub(r"^(ms|microsoft)\s+(?=\S{3,})", "", k)
+    return ALIASES.get(k, k)
+
+
 def _top(values: list[str], n: int) -> list[tuple[str, int]]:
     """Case-insensitive counting that displays the most common spelling of each item."""
     counts: Counter = Counter()
@@ -68,14 +79,13 @@ def _top(values: list[str], n: int) -> list[tuple[str, int]]:
         v = _clean(v)
         if not v:
             continue
-        key = v.casefold()
+        key = _key(v)
         counts[key] += 1
         spellings[key][v] += 1
-    return [(spellings[k].most_common(1)[0][0], c) for k, c in counts.most_common(n)]
-
-
-def _key(label: str) -> str:
-    return _clean(label).casefold()
+    def display(k):  # most common spelling, but "Excel" rather than "MS Excel"
+        return sorted(spellings[k].items(), key=lambda kv: (bool(re.match(r"(?i)(ms|microsoft) ", kv[0])), -kv[1],
+                                                            len(kv[0])))[0][0]
+    return [(display(k), c) for k, c in counts.most_common(n)]
 
 
 def _rows(store, since: datetime, until: datetime) -> list[dict]:
@@ -165,8 +175,9 @@ def compute_stats(store, threshold: int, days: int = 7, now: datetime | None = N
         by_cat[r.get("role_category") or "unknown"].append(r)
     categories = []
     for cat, rs in sorted(by_cat.items(), key=lambda kv: -len(kv[1])):
-        lows = [r["salary_min_pln_month"] for r in rs if r.get("salary_min_pln_month")]
-        highs = [r["salary_max_pln_month"] for r in rs if r.get("salary_max_pln_month")]
+        both = [r for r in rs if r.get("salary_min_pln_month") and r.get("salary_max_pln_month")]
+        lows = [r["salary_min_pln_month"] for r in both]
+        highs = [r["salary_max_pln_month"] for r in both]
         categories.append({
             "category": cat, "count": len(rs),
             "avg_score": round(statistics.mean(r["score"] or 0 for r in rs)),
@@ -206,7 +217,7 @@ def compute_stats(store, threshold: int, days: int = 7, now: datetime | None = N
         "sources": portals,
         "triaged_out": len(triaged),
         "health": health,
-        "triaged_sample": [f"{t['title']} · {t['company']}" for t in triaged[-12:]],
+        "triaged_sample": [f"{t['title']} · {t['company']}" for t in triaged[-8:]],
         "best_offers": [{"title": r["title"], "company": r["company"], "score": r["score"], "url": r["url"]}
                         for r in sorted(week, key=lambda r: -(r["score"] or 0))[:5]],
     }
@@ -226,153 +237,227 @@ def ai_recommendations(stats: dict, profile: str, call: Callable[..., dict | Non
 
 
 # ---------------------------------------------------------------- rendering
-def _fmt_pln(v) -> str:
-    return f"{v:,.0f}".replace(",", " ") if v else "–"
+# E-mail-safe HTML: table layout + inline styles (Gmail/Outlook ignore most <style> rules and flexbox).
+INK, INK2, MUTED = "#1f1f1e", "#52514e", "#8a8984"
+PAGE, CARD, LINE, TRACK = "#f4f3f0", "#ffffff", "#e7e5e0", "#eceae6"
+ACCENT = "#2a78d6"            # one hue for every magnitude bar - bars encode size, not identity
+GOOD, WARN = "#1a7f37", "#b42318"
+FONT = "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif"
+NUM = "font-variant-numeric:tabular-nums;white-space:nowrap"
+PORTALS = {"linkedin": "LinkedIn", "pracuj": "pracuj.pl", "nofluffjobs": "No Fluff Jobs",
+           "justjoin": "justjoin.it", "rocketjobs": "RocketJobs"}
 
 
-def _bar(share: int, colour: str = "#0969da") -> str:
-    w = max(2, min(100, share))
-    return (f"<div style='background:#eaeef2;width:120px;height:8px;border-radius:4px'>"
-            f"<div style='background:{colour};width:{w}%;height:8px;border-radius:4px'></div></div>")
+def _n(v) -> str:
+    """1234567 -> '1 234 567' (Polish-style thin grouping that no client turns into a link)."""
+    return f"{v:,.0f}".replace(",", " ") if isinstance(v, (int, float)) else "–"
 
 
-def _trend(now_c: int, prev_c: int) -> str:
-    if not prev_c:
-        return "<span style='color:#57606a'>new</span>" if now_c else ""
-    d = now_c - prev_c
-    if d == 0:
-        return "<span style='color:#57606a'>=</span>"
-    return f"<span style='color:{'#cf222e' if d > 0 else '#1a7f37'}'>{'▲' if d > 0 else '▼'}{abs(d)}</span>"
+def _esc(v) -> str:
+    return html.escape(str(v if v is not None else ""))
+
+
+def _card(title: str, body: str, note: str = "") -> str:
+    note_html = (f"<div style='font-size:12px;line-height:17px;color:{MUTED};margin:2px 0 12px'>{note}</div>"
+                 if note else "<div style='height:10px'></div>")
+    return (f"<tr><td style='padding:0 0 12px'><table role='presentation' width='100%' cellpadding='0' "
+            f"cellspacing='0' style='background:{CARD};border:1px solid {LINE};border-radius:10px'><tr>"
+            f"<td style='padding:18px 20px'><div style='font-size:15px;line-height:20px;font-weight:600;"
+            f"color:{INK}'>{title}</div>{note_html}{body}</td></tr></table></td></tr>")
+
+
+def _bars(items: list[dict], value: Callable[[dict], str], extra: Callable[[dict], str] | None = None,
+          extra_w: int = 44) -> str:
+    """Label | bar (share of offers) | value [| extra] rows."""
+    if not items:
+        return f"<div style='font-size:13px;color:{MUTED}'>No data this week.</div>"
+    top = max(i["share"] for i in items) or 1
+    rows = []
+    for it in items:
+        w = max(2, round(100 * it["share"] / top))  # scale to the largest bar so short lists stay readable
+        bar = (f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0'><tr>"
+               f"<td style='background:{TRACK};border-radius:4px;height:8px;line-height:8px;font-size:0'>"
+               f"<table role='presentation' width='{w}%' cellpadding='0' cellspacing='0'><tr>"
+               f"<td style='background:{ACCENT};border-radius:4px;height:8px;line-height:8px;font-size:0'>&nbsp;"
+               f"</td></tr></table></td></tr></table>")
+        ex = (f"<td width='{extra_w}' style='padding:5px 0 5px 10px;font-size:12px;color:{MUTED};text-align:right;"
+              f"width:{extra_w}px;{NUM}'>{extra(it)}</td>") if extra else ""
+        rows.append(f"<tr><td width='34%' style='padding:5px 12px 5px 0;font-size:13px;color:{INK};width:34%'>"
+                    f"{_esc(it['label'])}</td>"
+                    f"<td style='padding:5px 0;min-width:60px'>{bar}</td>"
+                    f"<td width='70' style='padding:5px 0 5px 12px;font-size:13px;color:{INK2};text-align:right;width:70px;{NUM}'>"
+                    f"{value(it)}</td>{ex}</tr>")
+    return (f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='table-layout:fixed'>"
+            f"{''.join(rows)}</table>")
+
+
+def _table(head: list[str], rows: list[list[str]], align: list[str]) -> str:
+    th = "".join(f"<td style='padding:0 0 6px;font-size:11px;letter-spacing:.02em;text-transform:uppercase;"
+                 f"color:{MUTED};text-align:{a};{'padding-left:10px;' if k else ''}'>{h}</td>"
+                 for k, (h, a) in enumerate(zip(head, align)))
+    body = "".join(
+        "<tr>" + "".join(f"<td style='padding:7px 0;border-top:1px solid {LINE};font-size:13px;color:{INK};"
+                         f"text-align:{a};{'font-variant-numeric:tabular-nums;' if a == 'right' else ''}"
+                         f"{'padding-left:10px;' if k else ''}'>{c}</td>"
+                         for k, (c, a) in enumerate(zip(r, align))) + "</tr>"
+        for r in rows)
+    return f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0'><tr>{th}</tr>{body}</table>"
+
+
+def _kpis(stats: dict) -> str:
+    v, prev = stats["verdicts"], stats["offers_prev_week"]
+    diff = stats["offers"] - prev
+    delta = (f"<div style='font-size:12px;color:{MUTED};{NUM}'>{'+' if diff >= 0 else '−'}{_n(abs(diff))} vs prev. week</div>"
+             if prev else f"<div style='font-size:12px;color:{MUTED}'>first week</div>")
+    lo, hi = stats["near_miss_range"]
+    tiles = [("Offers scored", _n(stats["offers"]), delta),
+             ("Average score", _n(stats["avg_score"]) if stats["avg_score"] is not None else "–",
+              f"<div style='font-size:12px;color:{MUTED}'>out of 100</div>"),
+             ("Apply", _n(v["apply"]), f"<div style='font-size:12px;color:{MUTED}'>{_n(v['stretch'])} stretch</div>"),
+             ("Near misses", _n(stats["near_miss_offers"]),
+              f"<div style='font-size:12px;color:{MUTED}'>score {lo}–{hi}</div>")]
+    def tile(k, label, value, sub):
+        return (
+        f"<td width='50%' style='padding:0 {0 if k % 2 else 8}px {0 if k >= 2 else 8}px 0;vertical-align:top'>"
+        f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='background:{CARD};"
+        f"border:1px solid {LINE};border-radius:10px'><tr><td style='padding:14px 14px 12px'>"
+        f"<div style='font-size:12px;color:{INK2}'>{label}</div>"
+        f"<div style='font-size:26px;line-height:32px;font-weight:600;color:{INK};{NUM}'>{value}</div>{sub}"
+        f"</td></tr></table></td>")
+    # 2 x 2 grid: fits a phone screen without media queries (which many mail apps ignore)
+    cells = [tile(k, *t) for k, t in enumerate(tiles)]
+    return (f"<tr><td style='padding:0 0 12px'><table role='presentation' width='100%' cellpadding='0' "
+            f"cellspacing='0'><tr>{cells[0]}{cells[1]}</tr><tr>{cells[2]}{cells[3]}</tr></table></td></tr>")
+
+
+def _recs(recs: dict) -> str:
+    items = "".join(
+        f"<tr><td style='vertical-align:top;padding:8px 10px 8px 0;width:22px'>"
+        f"<div style='width:22px;height:22px;line-height:22px;border-radius:11px;background:{ACCENT};color:#fff;"
+        f"font-size:12px;font-weight:600;text-align:center'>{k}</div></td>"
+        f"<td style='padding:8px 0;font-size:13px;line-height:19px;color:{INK}'><b>{_esc(r['skill'])}</b> – "
+        f"{_esc(r['why'])}<div style='color:{INK2};margin-top:2px'>First step: {_esc(r['first_step'])}</div></td></tr>"
+        for k, r in enumerate(recs["recommendations"], 1))
+    note = f"<div style='font-size:12px;color:{MUTED};margin-top:6px'>{_esc(recs['market_note'])}</div>" \
+        if recs.get("market_note") else ""
+    return _card(_esc(recs.get("headline") or "This week's recommendations"),
+                 f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0'>{items}</table>{note}")
+
+
+def _health_card(h: dict) -> str:
+    kv = [("Runs", f"{h['runs']} · avg {h['avg_minutes']} min · longest {h['max_minutes']} min"),
+          ("Stopped by time budget", f"{h['stopped_by_time']} run(s)"),
+          ("Avg stage time", f"search {h['avg_search_s']} s · pre-filter {h['avg_triage_s']} s · "
+                             f"scoring {h['avg_score_s']} s"),
+          ("Gemini", f"{_n(h['gemini_calls'])} calls · {_n(h['gemini_errors'])} failed · "
+                     f"{_n(h['tokens_in'])} tokens in / {_n(h['tokens_out'])} out"),
+          ("Offers scored / failed", f"{_n(h['scored'])} / {_n(h['failed'])}")]
+    rows = "".join(f"<tr><td style='padding:3px 12px 3px 0;font-size:12px;color:{MUTED};white-space:nowrap;"
+                   f"vertical-align:top'>{k}</td><td style='padding:3px 0;font-size:12px;color:{INK2}'>{_esc(v)}</td></tr>"
+                   for k, v in kv)
+    portal_rows = []
+    for name, p in sorted(h["portals"].items(), key=lambda kv: -kv[1]["cards"]):
+        zero = (f"<span style='color:{WARN};font-weight:600'>⚠ {p['zero_runs']}</span>" if p["zero_runs"] else "0")
+        portal_rows.append([_esc(PORTALS.get(name, name)), _n(p["cards"]), _n(p["new"]), _n(p["detail_failed"]), zero])
+    ptable = _table(["Portal", "Found", "New", "Description errors", "Runs with 0 found"], portal_rows,
+                    ["left", "right", "right", "right", "right"]) if portal_rows else ""
+    return _card("System health",
+                 f"<table role='presentation' cellpadding='0' cellspacing='0' style='margin-bottom:12px'>{rows}</table>"
+                 f"{ptable}")
 
 
 def build_report_html(stats: dict, recs: dict | None = None, csv_attached: bool = False) -> str:
-    e = html.escape
-    td = "style='padding:4px 10px 4px 0;vertical-align:middle'"
-    th = "style='text-align:left;padding:4px 10px 4px 0;color:#57606a;font-weight:normal;font-size:12px'"
-    h2 = "style='font-size:16px;margin:24px 0 8px'"
-    out = [f"<div style='font-family:Arial,sans-serif;color:#1f2328;max-width:680px'>",
-           f"<h1 style='font-size:20px;margin:0 0 4px'>Weekly market &amp; skill-gap report</h1>",
-           f"<div style='color:#57606a'>{e(stats['period_start'])} – {e(stats['period_end'])}</div>"]
+    n = stats["offers"]
+    blocks = [_kpis(stats)]
+    if n == 0:
+        blocks.append(_card("No offers this week", f"<div style='font-size:13px;color:{INK2}'>"
+                                                   f"The scanner didn't score any offers in this period.</div>"))
+    else:
+        if recs and recs.get("recommendations"):
+            blocks.append(_recs(recs))
+        elif n < MIN_OFFERS_FOR_AI:
+            blocks.append(_card("Recommendations", f"<div style='font-size:13px;color:{INK2}'>Only {n} offers this "
+                                                   f"week – recommendations start from {MIN_OFFERS_FOR_AI}.</div>"))
+        lo, hi = stats["near_miss_range"]
+        if stats["near_miss_gaps"]:
+            blocks.append(_card(
+                "What blocks near-miss offers",
+                _bars(stats["near_miss_gaps"], lambda g: f"{_n(g['count'])} · {g['share']}%"),
+                f"Gaps in the {_n(stats['near_miss_offers'])} offers that scored {lo}–{hi}, just below the e-mail "
+                f"threshold. Closing these turns real offers into “apply”."))
+        show_trend = stats["offers_prev_week"] > 0
 
-    v = stats["verdicts"]
-    diff = stats["offers"] - stats["offers_prev_week"]
-    out.append(
-        "<table style='margin:16px 0;border-collapse:collapse'><tr>" + "".join(
-            f"<td style='padding:8px 16px 8px 0'><div style='font-size:24px;font-weight:bold'>{val}</div>"
-            f"<div style='color:#57606a;font-size:12px'>{lbl}</div></td>"
-            for val, lbl in [
-                (stats["offers"], f"offers scored ({'+' if diff >= 0 else ''}{diff} vs prev. week)"),
-                (stats["avg_score"] if stats["avg_score"] is not None else "–", "average score"),
-                (v["apply"], "apply"), (v["stretch"], "stretch"),
-                (stats["near_miss_offers"],
-                 f"near misses ({stats['near_miss_range'][0]}–{stats['near_miss_range'][1]})"),
-            ]) + "</tr></table>")
+        def trend(g):
+            d = g["count"] - g["prev"]
+            if d == 0:
+                return "="
+            return f"<span style='color:{WARN if d > 0 else GOOD}'>{'▲' if d > 0 else '▼'} {abs(d)}</span>"
+        blocks.append(_card("Most common gaps", _bars(stats["top_gaps"], lambda g: f"{_n(g['count'])} · {g['share']}%",
+                                                      trend if show_trend else None),
+                            f"Share of all {_n(n)} offers" + (" · change vs previous week" if show_trend else "")))
+        blocks.append(_card("Most required tools",
+                            _bars(stats["top_required_tools"], lambda t: f"{_n(t['count'])} · {t['share']}%",
+                                  lambda t: f"gap {_n(t['as_gap'])}" if t["as_gap"] else "", extra_w=56),
+                            "Share of offers that require the tool · “gap” = offers where it was your gap"))
+        cat_rows = []
+        for c in stats["categories"]:
+            sal = (f"<div style='font-size:12px;color:{MUTED};margin-top:1px'>salary "
+                   f"<span style='white-space:nowrap'>{_n(c['median_min'])}–{_n(c['median_max'])} PLN</span> "
+                   f"<span style='white-space:nowrap'>· {c['with_salary']} offers</span></div>") if c["with_salary"] else ""
+            apply = f"<b style='color:{GOOD}'>{_n(c['apply'])}</b>" if c["apply"] else "0"
+            cat_rows.append([f"{_esc(c['category'])}{sal}", _n(c["count"]), _n(c["avg_score"]), apply])
+        wm = " · ".join(f"{_esc(k)} {_pct(c, n)}%" for k, c in stats["work_mode"].items())
+        blocks.append(_card("Categories", _table(["Category", "Offers", "Avg", "Apply"], cat_rows,
+                                                 ["left", "right", "right", "right"]),
+                            f"Salary = median monthly range of offers stating both ends; only "
+                            f"{stats['offers_with_salary_pct']}% of offers state a salary, gross and B2B mixed. "
+                            f"Work mode: {wm}."))
+        if len(stats.get("sources") or []) > 1:
+            rows = [[_esc(PORTALS.get(s_['source'], s_['source'])), _n(s_["count"]), _n(s_["avg_score"]),
+                     f"<b style='color:{GOOD}'>{_n(s_['apply'])}</b>" if s_["apply"] else "0"]
+                    for s_ in stats["sources"]]
+            blocks.append(_card("Portals", _table(["Portal", "Offers", "Avg score", "Apply"], rows,
+                                                  ["left", "right", "right", "right"])))
+        best = "".join(
+            f"<tr><td style='padding:9px 12px 9px 0;width:40px;vertical-align:top;"
+            f"border-top:{'0' if k == 0 else '1px solid ' + LINE}'>"
+            f"<div style='font-size:13px;font-weight:600;color:#fff;background:{GOOD if o['score'] >= stats['threshold'] else MUTED};"
+            f"border-radius:6px;text-align:center;padding:3px 0;{NUM}'>{o['score']}</div></td>"
+            f"<td style='padding:9px 0;border-top:{'0' if k == 0 else '1px solid ' + LINE};font-size:13px;line-height:18px'>"
+            f"<a href='{_esc(o['url'])}' style='color:{INK};font-weight:600;text-decoration:none'>{_esc(o['title'])}</a>"
+            f"<div style='color:{INK2}'>{_esc(o['company'])}</div></td></tr>"
+            for k, o in enumerate(stats["best_offers"]))
+        blocks.append(_card("Best offers this week",
+                            f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0'>{best}</table>"))
+        if stats.get("triaged_out"):
+            items = "".join(f"<li style='margin:0 0 3px'>{_esc(x)}</li>" for x in stats["triaged_sample"])
+            blocks.append(_card(f"Skipped by the AI pre-filter · {_n(stats['triaged_out'])}",
+                                f"<ul style='margin:0;padding-left:18px;font-size:12px;line-height:17px;color:{INK2}'>"
+                                f"{items}</ul>",
+                                "Dropped on title alone. Latest ones – check that nothing relevant is filtered out."))
+    if stats.get("health"):
+        blocks.append(_health_card(stats["health"]))
 
-    if stats["offers"] == 0:
-        out.append("<p>No offers were scored this week.</p></div>")
-        return "".join(out)
-
-    if recs:
-        out.append(f"<div style='background:#ddf4ff;padding:12px 16px;border-radius:8px'>"
-                   f"<b>{e(recs.get('headline', ''))}</b><ol style='margin:8px 0 0;padding-left:20px'>")
-        for r in recs["recommendations"]:
-            out.append(f"<li style='margin-bottom:6px'><b>{e(r['skill'])}</b> – {e(r['why'])}<br>"
-                       f"<span style='color:#57606a'>First step: {e(r['first_step'])}</span></li>")
-        out.append("</ol>")
-        if recs.get("market_note"):
-            out.append(f"<div style='margin-top:6px;color:#57606a'>{e(recs['market_note'])}</div>")
-        out.append("</div>")
-    elif stats["offers"] < MIN_OFFERS_FOR_AI:
-        out.append(f"<p style='color:#57606a'>Only {stats['offers']} offers this week – recommendations start "
-                   f"from {MIN_OFFERS_FOR_AI}.</p>")
-
-    if stats["near_miss_gaps"]:
-        out.append(f"<h2 {h2}>What blocks near-miss offers</h2>"
-                   f"<div style='color:#57606a;font-size:12px;margin-bottom:6px'>Gaps in the "
-                   f"{stats['near_miss_offers']} offers that scored just below the e-mail threshold.</div>"
-                   f"<table style='border-collapse:collapse'>")
-        for g in stats["near_miss_gaps"]:
-            out.append(f"<tr><td {td}>{e(g['label'])}</td><td {td}>{_bar(g['share'], '#bf8700')}</td>"
-                       f"<td {td}>{g['count']} ({g['share']}%)</td></tr>")
-        out.append("</table>")
-
-    out.append(f"<h2 {h2}>Most common gaps (all offers)</h2><table style='border-collapse:collapse'>"
-               f"<tr><th {th}>gap</th><th {th}></th><th {th}>offers</th><th {th}>vs prev.</th></tr>")
-    for g in stats["top_gaps"]:
-        out.append(f"<tr><td {td}>{e(g['label'])}</td><td {td}>{_bar(g['share'], '#cf222e')}</td>"
-                   f"<td {td}>{g['count']} ({g['share']}%)</td><td {td}>{_trend(g['count'], g['prev'])}</td></tr>")
-    out.append("</table>")
-
-    out.append(f"<h2 {h2}>Most required tools</h2><table style='border-collapse:collapse'>"
-               f"<tr><th {th}>tool</th><th {th}></th><th {th}>offers</th><th {th}>of which your gap</th></tr>")
-    for t in stats["top_required_tools"]:
-        out.append(f"<tr><td {td}>{e(t['label'])}</td><td {td}>{_bar(t['share'])}</td>"
-                   f"<td {td}>{t['count']} ({t['share']}%)</td><td {td}>{t['as_gap'] or ''}</td></tr>")
-    out.append("</table>")
-
-    out.append(f"<h2 {h2}>Categories</h2><table style='border-collapse:collapse'>"
-               f"<tr><th {th}>category</th><th {th}>offers</th><th {th}>avg score</th><th {th}>apply</th>"
-               f"<th {th}>median salary PLN/month*</th></tr>")
-    for c in stats["categories"]:
-        sal = (f"{_fmt_pln(c['median_min'])} – {_fmt_pln(c['median_max'])} <span style='color:#57606a'>"
-               f"(n={c['with_salary']})</span>") if c["with_salary"] else "–"
-        out.append(f"<tr><td {td}>{e(c['category'])}</td><td {td}>{c['count']}</td><td {td}>{c['avg_score']}</td>"
-                   f"<td {td}>{c['apply']}</td><td {td}>{sal}</td></tr>")
-    out.append("</table>")
-    wm = " · ".join(f"{e(k)} {_pct(c, stats['offers'])}%" for k, c in stats["work_mode"].items())
-    out.append(f"<div style='color:#57606a;font-size:12px;margin-top:6px'>* only {stats['offers_with_salary_pct']}% "
-               f"of offers state a salary; gross and B2B rates are mixed. Work mode: {wm}.</div>")
-
-    if len(stats.get("sources") or []) > 1:
-        labels = {"linkedin": "LinkedIn", "pracuj": "pracuj.pl", "nofluffjobs": "No Fluff Jobs", "justjoin": "justjoin.it", "rocketjobs": "RocketJobs"}
-        out.append(f"<h2 {h2}>Portals</h2><table style='border-collapse:collapse'>"
-                   f"<tr><th {th}>portal</th><th {th}>offers</th><th {th}>avg score</th><th {th}>apply</th></tr>")
-        for src in stats["sources"]:
-            out.append(f"<tr><td {td}>{e(labels.get(src['source'], src['source']))}</td><td {td}>{src['count']}</td>"
-                       f"<td {td}>{src['avg_score']}</td><td {td}>{src['apply']}</td></tr>")
-        out.append("</table>")
-
-    out.append(f"<h2 {h2}>Best offers this week</h2><ol style='padding-left:20px;margin:0'>")
-    for o in stats["best_offers"]:
-        out.append(f"<li><b>{o['score']}</b> – <a href='{e(o['url'] or '')}'>{e(o['title'] or '')}</a>"
-                   f" · {e(o['company'] or '')}</li>")
-    out.append("</ol>")
-
-    if stats.get("triaged_out"):
-        out.append(f"<h2 {h2}>Skipped by the AI pre-filter</h2><div style='color:#57606a;font-size:12px'>"
-                   f"{stats['triaged_out']} offers were dropped this week on title alone. Latest ones – check that "
-                   f"nothing relevant is being filtered out:</div><ul style='margin:6px 0;padding-left:20px;"
-                   f"color:#57606a;font-size:13px'>")
-        out += [f"<li>{e(x)}</li>" for x in stats["triaged_sample"]]
-        out.append("</ul>")
-
-    h = stats.get("health")
-    if h:
-        out.append(f"<h2 {h2}>System health</h2><table style='border-collapse:collapse;font-size:13px'>")
-        rows = [
-            ("runs", f"{h['runs']} (avg {h['avg_minutes']} min, longest {h['max_minutes']} min)"),
-            ("stopped by time budget", f"{h['stopped_by_time']} run(s)"),
-            ("avg stage time", f"search {h['avg_search_s']}s · pre-filter {h['avg_triage_s']}s · scoring {h['avg_score_s']}s"),
-            ("Gemini", f"{h['gemini_calls']} calls, {h['gemini_errors']} failed · "
-                       f"{h['tokens_in']:,} tokens in / {h['tokens_out']:,} out".replace(",", " ")),
-            ("offers scored / failed", f"{h['scored']} / {h['failed']}"),
-        ]
-        out += [f"<tr><td {td}><span style='color:#57606a'>{k}</span></td><td {td}>{e(v)}</td></tr>" for k, v in rows]
-        out.append("</table>")
-        if h["portals"]:
-            out.append(f"<table style='border-collapse:collapse;font-size:13px;margin-top:8px'><tr><th {th}>portal</th>"
-                       f"<th {th}>found</th><th {th}>new</th><th {th}>description errors</th><th {th}>runs with 0 found</th></tr>")
-            for name, p in sorted(h["portals"].items(), key=lambda kv: -kv[1]["cards"]):
-                warn = " style='color:#cf222e;font-weight:bold'" if p["zero_runs"] else ""
-                out.append(f"<tr><td {td}>{e(name)}</td><td {td}>{p['cards']}</td><td {td}>{p['new']}</td>"
-                           f"<td {td}>{p['detail_failed']}</td><td {td}><span{warn}>{p['zero_runs']}</span></td></tr>")
-            out.append("</table>")
-
-    foot = f"{stats['offers_total']} offers in the database."
+    foot = f"{_n(stats['offers_total'])} offers in the database"
     if csv_attached:
-        foot += " Full dataset attached as jobs.csv."
-    out.append(f"<p style='color:#57606a;font-size:12px;margin-top:24px'>{foot}</p></div>")
-    return "".join(out)
+        foot += " · full dataset attached as jobs.csv"
+    return (
+        f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+        f"<meta name='color-scheme' content='light only'><meta name='supported-color-schemes' content='light'></head>"
+        f"<body style='margin:0;padding:0;background:{PAGE}'>"
+        f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='background:{PAGE}'><tr>"
+        f"<td align='center' style='padding:24px 12px'>"
+        f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='max-width:640px;"
+        f"font-family:{FONT};color:{INK}'>"
+        f"<tr><td style='padding:0 2px 16px'><div style='font-size:12px;letter-spacing:.04em;text-transform:uppercase;"
+        f"color:{MUTED}'>Job scanner · weekly report</div>"
+        f"<div style='font-size:22px;line-height:28px;font-weight:600;color:{INK};margin-top:2px'>"
+        f"Market &amp; skill-gap report</div>"
+        f"<div style='font-size:13px;color:{INK2};margin-top:2px'>{_esc(stats['period_start'])} – "
+        f"{_esc(stats['period_end'])}</div></td></tr>"
+        + "".join(blocks) +
+        f"<tr><td style='padding:4px 2px 0;font-size:12px;color:{MUTED};text-align:center'>{foot}</td></tr>"
+        f"</table></td></tr></table></body></html>")
 
 
 def report_text(stats: dict, recs: dict | None = None) -> str:

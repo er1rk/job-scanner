@@ -316,7 +316,15 @@ def call_gemini(prompt: str, schema: dict, cfg: dict, api_key: str, temperature:
             USAGE["tokens_out"] += int(usage.get("candidatesTokenCount") or 0) + int(usage.get("thoughtsTokenCount") or 0)
             return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
         except (KeyError, IndexError, ValueError, TypeError):
-            return _gemini_failed()
+            # empty, blocked or cut-off answer - log why (no content, logs are public) and try again
+            try:
+                reason = (data.get("candidates") or [{}])[0].get("finishReason") or \
+                    (data.get("promptFeedback") or {}).get("blockReason") or "no candidates"
+            except Exception:
+                reason = "unreadable response"
+            print(f"  Gemini answer unusable ({reason}), retrying", file=sys.stderr)
+            time.sleep(5)
+            continue
     return _gemini_failed()
 
 
