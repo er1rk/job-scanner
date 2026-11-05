@@ -239,25 +239,30 @@ def salary_label(r: dict) -> str:
     return " ".join(p for p in parts if p)
 
 
-def pick_available_model(api_key: str, exclude: str = "") -> str | None:
-    """If the configured model doesn't exist for this key, find a Flash model that does."""
-    r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                     params={"key": api_key, "pageSize": 200}, timeout=30)
+def pick_available_model(api_key: str, exclude: set | None = None) -> str | None:
+    """Last resort when every configured model is gone: newest *lite* Flash model (generous free tier).
+    Non-lite models are never picked - on the free tier some allow only ~20 requests a day."""
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         params={"key": api_key, "pageSize": 200}, timeout=30)
+    except requests.RequestException:
+        return None
     if r.status_code != 200:
-        print(f"  Could not list models: {r.status_code} {r.text[:200]}", file=sys.stderr)
+        print(f"  Could not list models: {r.status_code}", file=sys.stderr)
         return None
     names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
              if "generateContent" in m.get("supportedGenerationMethods", [])]
-    flash = [n for n in names if "flash" in n and n != exclude
-             and not any(x in n for x in ("tts", "image", "live", "embedding"))]
-    # prefer stable over preview, newest first
-    flash.sort(key=lambda n: ("preview" in n or "exp" in n, [-int(x) for x in re.findall(r"\d+", n)[:2]]))
-    print(f"  Available Flash models: {', '.join(flash[:6]) or 'none'}")
-    return flash[0] if flash else None
+    lite = [n for n in names if "flash-lite" in n and n not in (exclude or set())
+            and not any(x in n for x in ("preview", "exp", "tts", "image", "live", "audio"))]
+    lite.sort(key=lambda n: [-int(x) for x in re.findall(r"\d+", n)[:2]] or [0])
+    print(f"  Available lite models: {', '.join(lite[:5]) or 'none'}")
+    return lite[0] if lite else None
 
 
 # Gemini usage of the current run, written to the runs table (monitoring of cost and reliability)
 USAGE = {"gemini_calls": 0, "gemini_errors": 0, "tokens_in": 0, "tokens_out": 0}
+DEAD_MODELS: set[str] = set()   # models that hit their daily quota / don't exist - skipped for the rest of the run
+DEFAULT_MODELS = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
 
 def _gemini_failed() -> None:
@@ -265,9 +270,39 @@ def _gemini_failed() -> None:
     return None
 
 
+def _models(cfg: dict) -> list[str]:
+    models = list(cfg.get("gemini_models") or [cfg.get("gemini_model")] + DEFAULT_MODELS)
+    return [m for m in dict.fromkeys(m for m in models if m) if m not in DEAD_MODELS]
+
+
+def _google_error(r) -> tuple[str, str, float | None]:
+    """(status, short message, retry delay in s) from a Gemini error response - safe to log (no prompt/key)."""
+    try:
+        err = r.json().get("error", {})
+        if not isinstance(err, dict):
+            raise ValueError
+    except Exception:
+        return "", str(getattr(r, "text", ""))[:120], None
+    quota, delay = "", None
+    for d in err.get("details", []):
+        for v in d.get("violations", []):
+            quota = v.get("quotaId", "") or quota
+        if d.get("retryDelay"):
+            try:
+                delay = float(str(d["retryDelay"]).rstrip("s"))
+            except ValueError:
+                pass
+    msg = re.sub(r"\s+", " ", str(err.get("message", "")))[:120]
+    return err.get("status", ""), (f"{quota}: " if quota else "") + msg, delay
+
+
 def call_gemini(prompt: str, schema: dict, cfg: dict, api_key: str, temperature: float = 0.2) -> dict | None:
-    """One structured-output call with retries, rate-limit back-off and model fallback.
-    Returns the parsed JSON object, or None if every attempt failed."""
+    """One structured-output call. Tries the configured models in order:
+    - 503/500/timeout (overloaded): short wait, then the next model for this call;
+    - 429 per-day quota: the model is dropped for the rest of the run, next model immediately;
+    - 429 per-minute: waits the delay Google asks for (max 60 s);
+    - 404: model retired - dropped, next model.
+    Every failure is logged with Google's status (no prompt, no key). Returns the parsed JSON or None."""
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -276,37 +311,42 @@ def call_gemini(prompt: str, schema: dict, cfg: dict, api_key: str, temperature:
             "responseSchema": schema,
         },
     }
-    for attempt in range(5):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['gemini_model']}:generateContent"
+    rotate = 0
+    for attempt in range(6):
+        models = _models(cfg)
+        if not models:
+            extra = pick_available_model(api_key, exclude=DEAD_MODELS)
+            if not extra:
+                print("  No Gemini model available - update gemini_models in config.yaml", file=sys.stderr)
+                return _gemini_failed()
+            print(f"  All configured models unavailable - trying {extra}")
+            cfg["gemini_models"] = [extra]
+            models = [extra]
+        model = models[rotate % len(models)]
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
-            r = requests.post(url, params={"key": api_key}, json=body, timeout=120)
-        except requests.RequestException as e:  # timeout / connection drop - retry, never crash the run
-            print(f"  Gemini request failed ({type(e).__name__}), retrying", file=sys.stderr)
-            time.sleep(10)
+            r = requests.post(url, params={"key": api_key}, json=body, timeout=90)
+        except requests.RequestException as e:  # timeout / connection drop - try the next model
+            print(f"  Gemini {model}: {type(e).__name__}", file=sys.stderr)
+            rotate += 1
+            time.sleep(3)
             continue
-        if r.status_code == 429:  # free-tier rate limit
-            time.sleep(30 * (attempt + 1))
-            continue
-        if r.status_code in (500, 503):  # model overloaded - wait, then switch to another model
-            if attempt >= 1 and not cfg.get("_fallback_used"):
-                cfg["_fallback_used"] = True
-                m = pick_available_model(api_key, exclude=cfg["gemini_model"])
-                if m:
-                    print(f"  '{cfg['gemini_model']}' overloaded - switching to {m}")
-                    cfg["gemini_model"] = m
-                    continue
-            time.sleep(15 * (attempt + 1))
-            continue
-        if r.status_code == 404 and not cfg.get("_model_checked"):
-            cfg["_model_checked"] = True
-            print(f"  Model '{cfg['gemini_model']}' not available - looking for another one")
-            m = pick_available_model(api_key)
-            if m:
-                cfg["gemini_model"] = m
-                print(f"  Using model: {m}")
-                continue
         if r.status_code != 200:
-            print(f"  Gemini error {r.status_code}: {r.text[:200]}", file=sys.stderr)
+            status, msg, delay = _google_error(r)
+            print(f"  Gemini {model}: {r.status_code} {status} {msg}", file=sys.stderr)
+            if r.status_code == 429 and "PerDay" in msg:
+                DEAD_MODELS.add(model)       # daily quota gone - waiting won't help today
+                continue
+            if r.status_code == 429:
+                time.sleep(min(delay or 20, 60))
+                continue
+            if r.status_code == 404:
+                DEAD_MODELS.add(model)
+                continue
+            if r.status_code in (500, 503, 504):
+                rotate += 1
+                time.sleep(3 * (attempt + 1))
+                continue
             return _gemini_failed()
         try:
             data = r.json()
@@ -314,7 +354,9 @@ def call_gemini(prompt: str, schema: dict, cfg: dict, api_key: str, temperature:
             USAGE["gemini_calls"] += 1
             USAGE["tokens_in"] += int(usage.get("promptTokenCount") or 0)
             USAGE["tokens_out"] += int(usage.get("candidatesTokenCount") or 0) + int(usage.get("thoughtsTokenCount") or 0)
-            return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+            result = json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+            cfg["_last_model"] = model
+            return result
         except (KeyError, IndexError, ValueError, TypeError):
             # empty, blocked or cut-off answer - log why (no content, logs are public) and try again
             try:
@@ -378,7 +420,7 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
     if not result:
         return None
     result["score"] = max(0, min(100, int(result.get("score") or 0)))
-    result["model"] = cfg["gemini_model"]
+    result["model"] = cfg.get("_last_model") or _models(cfg)[0]
     result.update(normalise_salary(result, cfg))
     return result
 
@@ -552,6 +594,7 @@ def main() -> None:
         return
     stats = {"started_at": now_iso()}
     USAGE.update(gemini_calls=0, gemini_errors=0, tokens_in=0, tokens_out=0)
+    DEAD_MODELS.clear()
     t0 = time.monotonic()
     budget = float(cfg.get("time_budget_minutes", 40)) * 60  # leave time for e-mails, report and saving the cache
 
@@ -574,9 +617,16 @@ def main() -> None:
     print(f"From queue: {len(backlog)}, new: {len(new)}, scoring now: {len(offers)}, "
           f"queued for next run: {len(overflow)}, expired from queue: {expired}")
 
-    results, failed, stopped_by_time = [], 0, 0
+    results, failed, stopped_by_time, gemini_down = [], 0, 0, False
     detail_failed: dict[str, int] = {}
+    fails_in_row = 0
     for i, o in enumerate(offers, 1):
+        if fails_in_row >= int(cfg.get("max_gemini_failures_in_row", 4)):
+            # Gemini is down or out of quota - don't burn the whole run on retries; try again next run
+            store.enqueue(offers[i - 1:])
+            gemini_down = True
+            print(f"Gemini failed {fails_in_row} offers in a row - stopping, {len(offers) - i + 1} offers queued")
+            break
         if time.monotonic() - t0 > budget:
             store.enqueue(offers[i - 1:])  # the rest waits for the next run instead of risking the job timeout
             stopped_by_time = len(offers) - i + 1
@@ -602,11 +652,13 @@ def main() -> None:
             store.save_offer(row, desc)  # every scored offer is kept, not only the good ones
             store.dequeue(o["id"])
             results.append(row)
+            fails_in_row = 0
             if args.dry_run:
                 print(f"[{i}/{len(offers)}] {s['score']:>3}  {o['title']} – {o['company']} ({o['location']})")
         else:
-            store.queue_failed(o)  # retried on the next run, dropped after 3 failed attempts
+            store.enqueue([o])  # Gemini failure is not the offer's fault - keep it without counting an attempt
             failed += 1
+            fails_in_row += 1
         time.sleep(6)  # stay under the free-tier requests-per-minute limit
     waiting = store.queue_size()
     t_score = time.monotonic()
@@ -632,6 +684,9 @@ def main() -> None:
     if stats.get("searches") and not stats.get("cards_found"):
         warning = ("The scraper found 0 offers across all sources - the portals may have changed their "
                    "page layout or blocked the requests. Check the latest Actions log.")
+    elif gemini_down or (USAGE["gemini_errors"] and not results and offers):
+        warning = ("Gemini was unavailable (overloaded or out of quota), so no offers could be scored. "
+                   "They are kept in the queue and will be scored on the next run.")
     elif stats.get("failed_sources"):
         warning = (f"Searching {', '.join(map(sources.label, stats['failed_sources']))} failed - "
                    f"its page format may have changed. The other sources worked.")
@@ -664,7 +719,7 @@ def main() -> None:
         send_weekly_report(store, cfg, profile, api_key, csv_text)
 
     store.save_run({**stats, "finished_at": now_iso(), "scored": len(results), "failed": failed,
-                    "notified": len(good), "model": cfg["gemini_model"],
+                    "notified": len(good), "model": cfg.get("_last_model"),
                     "queued": waiting, "queue_expired": expired, "triaged_out": len(triaged_out),
                     "stopped_by_time": stopped_by_time, **timing, **USAGE})
     close_db(store)

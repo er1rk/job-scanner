@@ -61,8 +61,13 @@ min_score_to_notify: 60
 # Categories Gemini sorts offers into (set your own in the private config)
 role_categories: ["data/analytics", "finance", "operations", "engineering", "sales/marketing", "other"]
 
-# Gemini model (if unavailable, the script picks an available Flash model automatically)
-gemini_model: "gemini-flash-lite-latest"
+# Gemini models, tried in this order. If one is overloaded (503) the next one is used for that call;
+# a model that hits its daily free-tier quota or no longer exists is skipped for the rest of the run.
+# Keep "lite" models here - on the free tier some non-lite models allow only ~20 requests a day.
+gemini_models: [gemini-flash-lite-latest, gemini-3.5-flash-lite, gemini-3.1-flash-lite]
+
+# Stop scoring after this many offers in a row failed because of Gemini (the rest waits in the queue)
+max_gemini_failures_in_row: 4
 
 # Approximate exchange rates used to compare salaries in PLN/month (update occasionally)
 fx_to_pln:
