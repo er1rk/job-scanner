@@ -26,7 +26,7 @@ flowchart LR
 ```
 
 **Pipeline:** LinkedIn + pracuj.pl + No Fluff Jobs + justjoin.it + RocketJobs → title filter → cross-portal de-duplication → Google Gemini (structured JSON: fit score + extracted facts) → SQLite → daily HTML e-mail + weekly market & skill-gap report (with CSV export for Power BI)
-**Runs:** scans every weekday, weekly report on Sunday – on GitHub Actions (free), no server needed – a main schedule off the full hour plus a backup schedule that only runs if the main one was dropped (GitHub sometimes skips scheduled runs).
+**Runs:** scans every day (each scheduled scan looks back to the last full scan, so a day GitHub skips loses nothing), weekly report on Sunday – on GitHub Actions (free), no server needed – a main schedule off the full hour plus a backup schedule that only runs if the main one was dropped (GitHub sometimes skips scheduled runs).
 
 ## How it works
 1. `scanner.py` pulls offers posted in the last 24 h for the searches in `config.yaml` from every portal listed under `sources` (one module per portal in `sources/`: LinkedIn's public job search, the JSON pracuj.pl embeds in its pages, the No Fluff Jobs API and the API shared by justjoin.it and its non-IT sister site RocketJobs). A portal that fails doesn't stop the others – the e-mail says which one broke.

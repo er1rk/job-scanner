@@ -797,3 +797,51 @@ class GeminiFallbackTests(unittest.TestCase):
             store.close()
         self.assertLessEqual(len(posts), 2 * 6)                          # stopped after 2 offers, not 8
         self.assertIn("Gemini was unavailable", send.call_args.args[2])
+
+
+class LookbackWindowTests(unittest.TestCase):
+    run_main = EndToEndTests.run_main
+
+    def seed(self, tmp, runs):
+        from datetime import datetime, timedelta, timezone
+        st = Store(Path(tmp) / "jobs.db")
+        now = datetime.now(timezone.utc)
+        for hours_ago, window in runs:
+            t = (now - timedelta(hours=hours_ago)).replace(microsecond=0)
+            st.save_run({"started_at": t.isoformat(), "finished_at": (t + timedelta(minutes=30)).isoformat(),
+                         "window_hours": window})
+        st.close()
+
+    def last_window(self, tmp):
+        st = Store(Path(tmp) / "jobs.db")
+        w = st.con.execute("SELECT window_hours FROM runs ORDER BY run_id DESC LIMIT 1").fetchone()[0]
+        st.close()
+        return w
+
+    def test_skipped_day_widens_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.seed(tmp, [(49.5, 24)])
+            self.run_main(tmp, [], {})
+            self.assertEqual(self.last_window(tmp), 52)                  # ~50 h since last full scan + 2 h overlap
+
+    def test_short_manual_run_does_not_count_as_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.seed(tmp, [(49.5, 24), (1, 1)])                           # a 1-hour queue-draining run
+            self.run_main(tmp, [], {})
+            self.assertEqual(self.last_window(tmp), 52)
+
+    def test_capped_and_normal_days(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.seed(tmp, [(300, 24)])
+            self.run_main(tmp, [], {})
+            self.assertEqual(self.last_window(tmp), 96)                  # max_lookback_hours
+        with tempfile.TemporaryDirectory() as tmp:
+            self.seed(tmp, [(20, 24)])
+            self.run_main(tmp, [], {})
+            self.assertEqual(self.last_window(tmp), 24)                  # a normal day keeps 24 h
+
+    def test_manual_hours_respected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.seed(tmp, [(49.5, 24)])
+            self.run_main(tmp, [], {"HOURS": "1"})
+            self.assertEqual(self.last_window(tmp), 1)

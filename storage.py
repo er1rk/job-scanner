@@ -132,7 +132,8 @@ class Store:
                                      "triaged_out": "INTEGER", "stopped_by_time": "INTEGER",
                                      "search_seconds": "INTEGER", "triage_seconds": "INTEGER",
                                      "score_seconds": "INTEGER", "gemini_calls": "INTEGER",
-                                     "gemini_errors": "INTEGER", "tokens_in": "INTEGER", "tokens_out": "INTEGER"},
+                                     "gemini_errors": "INTEGER", "tokens_in": "INTEGER", "tokens_out": "INTEGER",
+                                     "window_hours": "INTEGER"},
                             "offers": {"fingerprint": "TEXT"}}.items():
             have = {r[1] for r in self.con.execute(f"PRAGMA table_info({table})")}
             for col, typ in cols.items():
@@ -258,6 +259,17 @@ class Store:
         today = datetime.now(timezone.utc).date().isoformat()
         return bool(self.con.execute(
             "SELECT 1 FROM runs WHERE finished_at >= ? LIMIT 1", (today,)).fetchone())
+
+    def last_full_scan_start(self, min_window: int = 20) -> datetime | None:
+        """Start of the latest scan that looked back at least min_window hours (short manual test runs,
+        e.g. 1 h to empty the queue, don't count as coverage)."""
+        r = self.con.execute(
+            "SELECT MAX(started_at) FROM runs WHERE finished_at IS NOT NULL AND "
+            "(window_hours IS NULL OR window_hours >= ?)", (min_window,)).fetchone()
+        try:
+            return datetime.fromisoformat(r[0]) if r and r[0] else None
+        except ValueError:
+            return None
 
     def report_sent_today(self) -> bool:
         today = datetime.now(timezone.utc).date().isoformat()
