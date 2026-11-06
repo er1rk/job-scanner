@@ -615,7 +615,8 @@ def main() -> None:
         return
 
     # Optional overrides for manual test runs (set from the "Run workflow" form)
-    if os.getenv("HOURS"):
+    manual_hours = os.getenv("HOURS", "") not in ("", "auto")  # "auto" = external trigger, like a schedule
+    if manual_hours:
         cfg["posted_within_hours"] = int(os.getenv("HOURS"))
     if os.getenv("MIN_SCORE"):
         cfg["min_score_to_notify"] = int(os.getenv("MIN_SCORE"))
@@ -644,7 +645,7 @@ def main() -> None:
         print("Today's main run already happened - backup run skipped")
         close_db(store)
         return
-    if not os.getenv("HOURS"):  # scheduled run: look back to the last full scan, so a skipped day loses nothing
+    if not manual_hours:  # scheduled run: look back to the last full scan, so a skipped day loses nothing
         last = store.last_full_scan_start()
         if last:
             gap = math.ceil((datetime.now(timezone.utc) - last).total_seconds() / 3600) + 2  # 2 h overlap

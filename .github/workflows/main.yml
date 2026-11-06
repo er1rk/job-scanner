@@ -28,6 +28,14 @@ on:
         description: "Also send the weekly market & skill-gap report"
         type: boolean
         default: false
+      auto:
+        description: "Scheduled-style run (used by the external trigger): auto look-back, skipped if today's run already happened"
+        type: boolean
+        default: false
+      report_only:
+        description: "Only send the weekly report (no scan)"
+        type: boolean
+        default: false
 
 # Never run two scans at once: both would restore the same database and the later save would overwrite
 # the earlier one. A second run waits for the first.
@@ -76,13 +84,15 @@ jobs:
           DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
-          HOURS: ${{ inputs.hours }}
+          HOURS: ${{ inputs.auto && 'auto' || inputs.hours }}
           MIN_SCORE: ${{ inputs.min_score }}
           IGNORE_SEEN: ${{ inputs.ignore_seen }}
           ATTACH_CSV: ${{ inputs.attach_csv }}
           SEND_REPORT: ${{ inputs.send_report }}
-          BACKUP_RUN: ${{ github.event.schedule == '47 8 * * *' || github.event.schedule == '41 10 * * 0' }}
-          REPORT_ONLY: ${{ github.event.schedule == '13 8 * * 0' || github.event.schedule == '41 10 * * 0' }}
+          # Every scheduled or external run skips itself if today's scan / report already happened, so the
+          # external trigger and GitHub's own (unreliable) schedule never send the same e-mail twice.
+          BACKUP_RUN: ${{ github.event_name == 'schedule' || inputs.auto }}
+          REPORT_ONLY: ${{ github.event.schedule == '13 8 * * 0' || github.event.schedule == '41 10 * * 0' || inputs.report_only }}
         run: python scanner.py
 
       - name: Save database

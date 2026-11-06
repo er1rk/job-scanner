@@ -898,3 +898,21 @@ class RealEmailPathTests(unittest.TestCase):
             self.assertEqual(store.con.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)
             self.assertEqual(store.con.execute("SELECT notified FROM offers").fetchone()[0], 0)  # not marked sent
             store.close()
+
+
+class ExternalTriggerTests(unittest.TestCase):
+    run_main = LookbackWindowTests.run_main
+    seed = LookbackWindowTests.seed
+    last_window = LookbackWindowTests.last_window
+
+    def test_auto_hours_behaves_like_a_schedule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.seed(tmp, [(49.5, 24)])
+            self.run_main(tmp, [], {"HOURS": "auto"})
+            self.assertEqual(self.last_window(tmp), 52)
+
+    def test_auto_run_skipped_if_today_already_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, [], {})
+            send = self.run_main(tmp, [], {"HOURS": "auto", "BACKUP_RUN": "true"})
+            send.assert_not_called()
