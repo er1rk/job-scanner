@@ -518,6 +518,25 @@ def build_email(results: list[dict], csv_text: str | None = None, warning: str =
         + "</table></td></tr></table></body></html>")
 
 
+def send_html(subject: str, body_html: str, csv_text: str | None = None) -> None:
+    sender, password = os.getenv("EMAIL_ADDRESS"), os.getenv("EMAIL_APP_PASSWORD")
+    if not (sender and password):
+        print("E-mail not configured - skipping notification")
+        return
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"], msg["To"] = sender, os.getenv("EMAIL_TO") or sender
+    msg.set_content("Open this e-mail in an HTML-capable client.")
+    msg.add_alternative(body_html, subtype="html")
+    if csv_text:
+        msg.add_attachment(csv_text.encode("utf-8"), maintype="text", subtype="csv",
+                           filename=f"jobs_{date.today():%Y-%m-%d}.csv")
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(sender, password)
+        smtp.send_message(msg)
+    print(f"E-mail sent: {subject.split(':')[0]}")
+
+
 def send_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0,
                triaged_out: int = 0, scored: int | None = None, threshold: int = 60) -> None:
     if results:
@@ -550,7 +569,12 @@ def open_db() -> Store:
         sys.exit("Set the DB_ENCRYPTION_KEY secret - the database is only cached encrypted.")
     if key and DB_ENC_FILE.exists():
         decrypt_file(DB_ENC_FILE, DB_FILE, key)
-    return Store(DB_FILE)
+    global _OPEN_STORE
+    _OPEN_STORE = Store(DB_FILE)
+    return _OPEN_STORE
+
+
+_OPEN_STORE: Store | None = None
 
 
 def close_db(store: Store) -> None:
@@ -748,18 +772,35 @@ def main() -> None:
     digest_csv = None if report_due else csv_text
     # By default a digest goes out after every run, even with no matches - so a missing e-mail always means
     # the run didn't happen (GitHub can drop scheduled runs) rather than "nothing new today".
+    email_error = None
     if good or digest_csv or warning or cfg.get("email_every_run", True):
-        send_email(good, digest_csv, warning, waiting, len(triaged_out), len(results), cfg["min_score_to_notify"])
-        store.mark_notified([r["id"] for r in good])
+        try:
+            send_email(good, digest_csv, warning, waiting, len(triaged_out), len(results), cfg["min_score_to_notify"])
+            store.mark_notified([r["id"] for r in good])
+        except Exception as e:  # scoring results are saved anyway; the job is failed below so it shows up
+            email_error = e
+            print(f"E-mail failed: {type(e).__name__}: {e}", file=sys.stderr)
     if report_due:
-        send_weekly_report(store, cfg, profile, api_key, csv_text)
+        try:
+            send_weekly_report(store, cfg, profile, api_key, csv_text)
+        except Exception as e:
+            email_error = email_error or e
+            print(f"Weekly report failed: {type(e).__name__}: {e}", file=sys.stderr)
 
     store.save_run({**stats, "finished_at": now_iso(), "scored": len(results), "failed": failed,
                     "notified": len(good), "model": cfg.get("_last_model"),
                     "queued": waiting, "queue_expired": expired, "triaged_out": len(triaged_out),
                     "stopped_by_time": stopped_by_time, **timing, **USAGE})
     close_db(store)
+    if email_error:
+        sys.exit(f"Run finished and saved, but the e-mail failed: {email_error}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # Whatever happened, encrypt what was saved so far - the workflow caches it even after a failure,
+        # so a crash at the end (e.g. e-mail) never throws away a whole run of scoring.
+        if _OPEN_STORE is not None and DB_FILE.exists():
+            close_db(_OPEN_STORE)

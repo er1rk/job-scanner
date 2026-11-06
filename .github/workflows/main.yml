@@ -61,8 +61,8 @@ jobs:
           restore-keys: seen-
 
       # The database is cached ONLY encrypted (key in the DB_ENCRYPTION_KEY secret).
-      # A new cache entry is saved after every run; the newest one is restored next time.
-      - uses: actions/cache@v4
+      # Restored here, saved in the last step - also when the scan step failed, so its work isn't lost.
+      - uses: actions/cache/restore@v4
         with:
           path: data/jobs.db.enc
           key: jobdb-enc-${{ github.run_id }}
@@ -84,3 +84,10 @@ jobs:
           BACKUP_RUN: ${{ github.event.schedule == '47 8 * * *' || github.event.schedule == '41 10 * * 0' }}
           REPORT_ONLY: ${{ github.event.schedule == '13 8 * * 0' || github.event.schedule == '41 10 * * 0' }}
         run: python scanner.py
+
+      - name: Save database
+        if: always() && hashFiles('data/jobs.db.enc') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: data/jobs.db.enc
+          key: jobdb-enc-${{ github.run_id }}
