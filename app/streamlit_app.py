@@ -46,7 +46,11 @@ def get_backend():
     if "backend" in st.session_state:
         return st.session_state.backend
     from supabase import create_client
-    url, key = secret("SUPABASE_URL"), secret("SUPABASE_ANON_KEY")
+    url, key = secret("SUPABASE_URL"), (secret("SUPABASE_ANON_KEY") or "").strip().strip("'\"")
+    if url:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from supabase_sync import normalise_url
+        url = normalise_url(url)
     if not (url and key):
         st.error("Set SUPABASE_URL and SUPABASE_ANON_KEY in the app's secrets.")
         st.stop()

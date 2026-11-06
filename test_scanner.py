@@ -1070,3 +1070,13 @@ class SupabaseSyncTests(unittest.TestCase):
             st = Store(Path(tmp) / "jobs.db")
             self.assertEqual(st.count(), 1)                                  # scan finished and saved
             st.close()
+
+
+class SupabaseUrlTests(unittest.TestCase):
+    def test_copy_paste_slips_are_fixed(self):
+        from supabase_sync import Supabase, normalise_url
+        good = "https://abcdefghijklmnopqrst.supabase.co"
+        for raw in (good, good + "/", ' "' + good + '" ', "abcdefghijklmnopqrst.supabase.co",
+                    "abcdefghijklmnopqrst", good + "/rest/v1", "\n" + good + "\n"):
+            self.assertEqual(normalise_url(raw), good, raw)
+        self.assertEqual(Supabase(" 'abcdefghijklmnopqrst' ", ' "key" ').headers["apikey"], "key")
