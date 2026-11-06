@@ -136,7 +136,7 @@ class Store:
                                      "gemini_errors": "INTEGER", "tokens_in": "INTEGER", "tokens_out": "INTEGER",
                                      "window_hours": "INTEGER"},
                             "triaged": {"reason": "TEXT"},
-                            "offers": {"fingerprint": "TEXT"}}.items():
+                            "offers": {"fingerprint": "TEXT", "synced": "INTEGER DEFAULT 0"}}.items():
             have = {r[1] for r in self.con.execute(f"PRAGMA table_info({table})")}
             for col, typ in cols.items():
                 if col not in have:
@@ -276,6 +276,7 @@ class Store:
     # ------------------------------------------------------------ offers
     def save_offer(self, row: dict, description: str = "") -> None:
         data = {k: row.get(k) for k in EXPORT_COLUMNS + ["fingerprint"] if k in row}
+        data["synced"] = 0  # changed -> send to Supabase on the next sync
         for f in LIST_FIELDS:
             if f in data and data[f] is not None:
                 data[f] = json.dumps(data[f], ensure_ascii=False)
@@ -287,7 +288,7 @@ class Store:
         cols = ", ".join(data)
         marks = ", ".join("?" for _ in data)
         # re-scoring an offer updates it but keeps when it was first seen and any manual labels
-        keep = {"id", "first_seen", "user_label", "status", "notified"}
+        keep = {"id", "first_seen", "user_label", "status", "notified"}  # synced is reset by the update
         updates = ", ".join(f"{c} = excluded.{c}" for c in data if c not in keep)
         self.con.execute(
             f"INSERT INTO offers ({cols}) VALUES ({marks}) ON CONFLICT(id) DO UPDATE SET {updates}",
@@ -295,7 +296,7 @@ class Store:
         self.con.commit()
 
     def mark_notified(self, ids: list[str]) -> None:
-        self.con.executemany("UPDATE offers SET notified = 1 WHERE id = ?", [(i,) for i in ids])
+        self.con.executemany("UPDATE offers SET notified = 1, synced = 0 WHERE id = ?", [(i,) for i in ids])
         self.con.commit()
 
     def description(self, offer_id: str) -> str:

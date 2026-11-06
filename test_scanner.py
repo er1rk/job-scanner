@@ -994,3 +994,79 @@ class FreshFirstAndFindTests(unittest.TestCase):
         name, text = sent.call_args.args[3][0]
         self.assertTrue(name.startswith("skipped_by_ai_"))
         self.assertIn("Java Developer", text)
+
+
+class SupabaseSyncTests(unittest.TestCase):
+    def fake_api(self):
+        calls = []
+        def request(method, url, headers=None, json=None, timeout=None):
+            calls.append((method, url.split("/rest/v1/")[1], json, headers))
+            r = mock.Mock(status_code=200 if method == "GET" else 201, text="")
+            r.json.return_value = [{"key": "keywords", "value": ["kyc analyst", " "]},
+                                   {"key": "min_score_to_notify", "value": 55},
+                                   {"key": "locations", "value": "not a list"},
+                                   {"key": "unknown", "value": [1]}]
+            return r
+        return calls, request
+
+    def test_sync_sends_changes_once_and_converts_types(self):
+        import supabase_sync
+        calls, request = self.fake_api()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(supabase_sync.requests, "request", side_effect=request):
+            st = Store(Path(tmp) / "jobs.db")
+            st.save_offer({"id": "1", "title": "KYC Analyst", "company": "Bank", "url": "u", **GEMINI_RESULT})
+            st.save_run({"started_at": "2026-11-06T06:00:00+00:00", "finished_at": "2026-11-06T06:30:00+00:00",
+                         "scored": 1, "sources": json.dumps({"linkedin": {"cards": 5}})})
+            st.enqueue([{"id": "q1", "title": "Fraud Analyst"}])
+            st.save_skipped([{"id": "s1", "title": "Senior X"}], "title")
+            counts = supabase_sync.sync(st, "https://x.supabase.co", "service")
+            self.assertEqual(counts, {"offers": 1, "runs": 1, "queue": 1, "skipped": 1})
+            offers = next(c for c in calls if c[0] == "POST" and c[1].startswith("offers"))
+            row = offers[2][0]
+            self.assertEqual(row["gaps"], ["SQL"])                         # JSON text -> real list for jsonb
+            self.assertIs(row["notified"], False)
+            self.assertIs(row["polish_required"], True)
+            self.assertIn("resolution=merge-duplicates", offers[3]["Prefer"])
+            self.assertEqual(offers[3]["Authorization"], "Bearer service")
+            self.assertIn(("DELETE", "queue?id=not.is.null"), [(c[0], c[1]) for c in calls])
+            runs = next(c for c in calls if c[1].startswith("runs"))
+            self.assertEqual(runs[2][0]["sources"], {"linkedin": {"cards": 5}})
+            self.assertEqual(next(c for c in calls if c[1].startswith("skipped?on"))[2][0]["reason"], "title")
+
+            calls.clear()
+            supabase_sync.sync(st, "https://x.supabase.co", "service", {"keywords": ["kyc"], "gemini_model": "m"})
+            eff = next(c for c in calls if c[1].startswith("effective_settings"))
+            self.assertEqual(eff[2], [{"key": "keywords", "value": ["kyc"], "updated_at": eff[2][0]["updated_at"]}])
+            calls.clear()
+            self.assertEqual(supabase_sync.sync(st, "https://x.supabase.co", "service")["offers"], 0)  # nothing new
+            st.mark_notified(["1"])
+            self.assertEqual(supabase_sync.sync(st, "https://x.supabase.co", "service")["offers"], 1)  # changed again
+            st.close()
+
+    def test_settings_are_validated(self):
+        import supabase_sync
+        calls, request = self.fake_api()
+        with mock.patch.object(supabase_sync.requests, "request", side_effect=request):
+            got = supabase_sync.load_settings("https://x.supabase.co", "k")
+        self.assertEqual(got, {"keywords": ["kyc analyst"], "min_score_to_notify": 55})
+
+    def test_errors_are_raised_without_row_data(self):
+        import supabase_sync
+        bad = mock.Mock(status_code=401, text='{"message":"Invalid API key"}')
+        with mock.patch.object(supabase_sync.requests, "request", return_value=bad):
+            with self.assertRaises(RuntimeError) as e:
+                supabase_sync.Supabase("https://x.supabase.co", "k").select("settings")
+        self.assertIn("401", str(e.exception))
+
+    def test_scan_uses_app_settings_and_survives_sync_failure(self):
+        import supabase_sync
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(supabase_sync, "load_settings", return_value={"min_score_to_notify": 90}), \
+             mock.patch.object(supabase_sync, "sync", side_effect=RuntimeError("POST offers: 500")):
+            send = EndToEndTests.run_main(self, tmp, [], {"SUPABASE_URL": "https://x", "SUPABASE_SERVICE_KEY": "k"},
+                                          email_every_run=True)
+            good, *_ , threshold = send.call_args.args
+            self.assertEqual((good, threshold), ([], 90))                   # 82 < 90 from the app settings
+            st = Store(Path(tmp) / "jobs.db")
+            self.assertEqual(st.count(), 1)                                  # scan finished and saved
+            st.close()
