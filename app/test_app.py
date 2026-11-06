@@ -35,6 +35,10 @@ class AppTests(unittest.TestCase):
                 at = self.run_app(page)
                 self.assertFalse(at.exception, [e.value for e in at.exception])
         self.assertTrue(any("offers" in c.value for c in at.sidebar.caption))
+        side = {m.label: m.value for m in at.sidebar.metric}
+        self.assertEqual(side["In queue"], "2")
+        self.assertIn("Follow-ups due", side)
+        self.assertTrue(any(b.label == "🔄 Scan now" for b in at.sidebar.button))
 
     def test_home_summary(self):
         at = self.run_app("home")

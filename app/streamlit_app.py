@@ -474,12 +474,9 @@ def page_scanner():
     m4.metric("Waiting in queue", len(queue))
 
     with st.container(border=True):
-        st.markdown("**Run the scanner**")
-        b1, b2 = st.columns(2)
-        if b1.button("🔄 Scan now", type="primary", width="stretch"):
-            ok, msg = dispatch_scan({"hours": "24"})
-            (st.success if ok else st.error)(msg)
-        if b2.button("📊 Send weekly report now", width="stretch"):
+        st.markdown("**Weekly report**")
+        st.caption("Scans start from **🔄 Scan now** in the side panel.")
+        if st.button("📊 Send weekly report now", width="stretch"):
             ok, msg = dispatch_scan({"report_only": "true"})
             (st.success if ok else st.error)(msg.replace("Scan started", "Report requested").split(" – ")[0])
 
@@ -595,15 +592,49 @@ def page_market():
 # ---------------------------------------------------------------- main
 st.markdown(CSS, unsafe_allow_html=True)
 APP = {"backend": get_backend()}
-with st.sidebar:
-    st.markdown("### 🔎 AI Job Scanner")
-    refresh = st.button("↻ Refresh data", width="stretch")
+refresh = st.session_state.pop("refresh", False)
 APP["data"] = load(APP["backend"], force=refresh)
-with st.sidebar:
-    st.caption(f"Data loaded {APP['data']['loaded'].astimezone().strftime('%H:%M')} · {len(APP['data']['offers'])} offers")
-    if os.getenv("APP_BACKEND") != "local" and st.button("Log out", width="stretch"):
+
+
+def sidebar_status(d: dict) -> None:
+    """Always-visible scanner status + actions (desktop; on a phone it sits behind the ≫ icon)."""
+    st.markdown("### 🔎 AI Job Scanner")
+    runs, apps = d["runs"], d["apps"]
+    last = runs.iloc[0] if not runs.empty else None
+    if last is not None and pd.notna(last["finished_at"]):
+        hours = (pd.Timestamp.now(tz="UTC") - last["finished_at"]).total_seconds() / 3600
+        errors = int(clean(last.get("gemini_errors")) or 0)
+        when = last["finished_at"].tz_convert("Europe/Warsaw").strftime("%d %b, %H:%M")
+        ago = f"{hours:.0f} h ago" if hours >= 1 else "just now"
+        if hours >= 26:
+            st.warning(f"No scan for {ago.removesuffix(' ago')} (last {when})", icon=":material/warning:")
+        elif errors:
+            st.warning(f"Last scan {ago} · {errors} Gemini errors", icon=":material/warning:")
+        else:
+            st.success(f"Last scan {ago} · {when}", icon=":material/check_circle:")
+        st.caption(f"Scored {int(clean(last.get('scored')) or 0)} · e-mailed {int(clean(last.get('notified')) or 0)}")
+    else:
+        st.info("No scans yet")
+    follow = pd.to_datetime(apps["follow_up_on"], errors="coerce") if not apps.empty else pd.Series(dtype="datetime64[ns]")
+    due = int(((apps["status"].isin(["applied", "interview"])) & (follow <= pd.Timestamp(date.today()))).sum()) \
+        if not apps.empty else 0
+    c1, c2 = st.columns(2)
+    c1.metric("In queue", len(d["queue"]))
+    c2.metric("Follow-ups due", due)
+    if st.button("🔄 Scan now", type="primary", width="stretch", key="side-scan"):
+        ok, msg = dispatch_scan({"hours": "24"})
+        (st.success if ok else st.error)(msg)
+    if st.button("↻ Refresh data", width="stretch", key="side-refresh"):
+        st.session_state.refresh = True
+        st.rerun()
+    st.caption(f"Data loaded {d['loaded'].astimezone().strftime('%H:%M')} · {len(d['offers'])} offers")
+    if os.getenv("APP_BACKEND") != "local" and st.button("Log out", width="stretch", key="side-logout"):
         st.session_state.clear()
         st.rerun()
+
+
+with st.sidebar:
+    sidebar_status(APP["data"])
 
 PAGES = {
     "home": st.Page(page_home, title="Home", icon=":material/home:", url_path="home",

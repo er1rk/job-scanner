@@ -73,8 +73,10 @@ Gap names are merged case-insensitively. On report days the CSV is attached to t
 | **Home** | the morning summary: new offers and new matches from the last 24 h, follow-ups due (one tap: *followed up* / *rejected*), scanner health, and the best new matches with quick actions |
 | **Offers** | offers as cards in the style of the e-mail digest (score ring, salary, work mode, contract, English), search and filters; the selected offer opens beside the list (above it on a phone) with the reason, strengths and gaps and one-tap **Save / Applied / Not interested** – *Applied* sets today's date and a follow-up reminder a week later |
 | **Applications** | kanban board: Saved → Applied → Interview → Offer, plus Closed; move a card to the next stage in one tap, edit dates and notes in a pop-over; due follow-ups in red |
-| **Scanner** | last scans, queue, skipped offers with the reason, **Scan now** / **Send weekly report now** (GitHub API), and the search settings – keywords, locations, title filters, threshold – which the scanner reads at the start of every run |
+| **Scanner** | last scans, queue, skipped offers with the reason, **Send weekly report now** (GitHub API), and the search settings – keywords, locations, title filters, threshold – which the scanner reads at the start of every run |
 | **Market** | what blocks near-miss offers, most required tools, offers per day by portal, salary ranges by category |
+
+A **side panel** on every page shows the scanner's status (last scan, Gemini errors, a warning if no scan for a day), the queue and follow-ups due, with **Scan now** (GitHub API) and *Refresh data*.
 
 Works on a phone: columns stack, the summary turns into a 2 × 2 grid and the offer details move above the list.
 
