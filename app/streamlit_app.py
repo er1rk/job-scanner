@@ -68,12 +68,20 @@ def get_backend():
     st.stop()
 
 
+def load_feedback(backend):
+    """None = the feedback table doesn't exist yet (supabase/schema.sql not re-run) - the app still works."""
+    try:
+        return backend.feedback()
+    except Exception:
+        return None
+
+
 def load(backend, force: bool = False) -> dict:
     if force or "data" not in st.session_state:
         st.session_state.data = {
             "offers": backend.offers(), "runs": backend.runs(), "queue": backend.queue(),
             "skipped": backend.skipped(), "apps": backend.applications(), "settings": backend.settings(),
-            "effective": backend.effective_settings(),
+            "effective": backend.effective_settings(), "feedback": load_feedback(backend),
             "loaded": datetime.now(timezone.utc),
         }
     return st.session_state.data
@@ -512,21 +520,57 @@ def page_scanner():
                                     "minutes": "Minutes"})
 
     st.markdown("#### Skipped offers (last 30 days)")
+    fb = d.get("feedback")
     if skipped.empty:
         st.caption("Nothing skipped yet.")
     else:
+        st.caption("Tick offers you'd want to see and press **★ Interested**: the next scan scores them, and the AI "
+                   "pre-filter gets your marked titles as examples of offers to keep.")
         q1, q2 = st.columns([3, 2])
         q = q1.text_input("Find a skipped offer", placeholder="title or company", label_visibility="collapsed")
         why = q2.multiselect("Reason", list(REASONS.values()), default=["AI pre-filter"], label_visibility="collapsed")
-        sk = skipped.assign(reason=skipped["reason"].map(REASONS).fillna(skipped["reason"]),
-                            portal=skipped["source"].map(PORTALS))
+        marked = set(fb["id"]) if fb is not None and not fb.empty else set()
+        sk = skipped.assign(reason_label=skipped["reason"].map(REASONS).fillna(skipped["reason"]),
+                            portal=skipped["source"].map(PORTALS),
+                            interested=skipped["id"].isin(marked).map({True: "★", False: ""}))
         if why:
-            sk = sk[sk["reason"].isin(why)]
+            sk = sk[sk["reason_label"].isin(why)]
         if q:
             sk = sk[(sk["title"].fillna("") + " " + sk["company"].fillna("")).str.contains(q, case=False, regex=False)]
-        st.dataframe(sk[["title", "company", "url", "reason", "portal"]].head(300), hide_index=True,
-                     width="stretch",
-                     column_config={"url": st.column_config.LinkColumn("Link", display_text="Open ↗")})
+        sk = sk.head(300).reset_index(drop=True)
+        event = st.dataframe(sk[["interested", "title", "company", "url", "reason_label", "portal"]], hide_index=True,
+                             width="stretch", on_select="rerun", selection_mode="multi-row", key="skipped-table",
+                             column_config={"interested": st.column_config.TextColumn("★", width=36),
+                                            "url": st.column_config.LinkColumn("Link", display_text="Open ↗"),
+                                            "reason_label": "Skipped by", "title": "Title", "company": "Company",
+                                            "portal": "Portal"})
+        picked = sk.iloc[event.selection.rows] if event and event.selection.rows else sk.iloc[0:0]
+        b1, b2 = st.columns(2)
+        if fb is None:
+            st.info("To mark offers, run the updated `supabase/schema.sql` once in Supabase (SQL Editor).")
+        else:
+            if b1.button(f"★ Interested ({len(picked)})", type="primary", width="stretch", disabled=picked.empty):
+                rows = [r for r in picked.to_dict("records") if r["reason"] != "duplicate"]
+                if rows:
+                    backend.mark_interested(rows)
+                    d["feedback"] = load_feedback(backend)
+                    st.toast(f"Marked {len(rows)} – scored on the next scan")
+                notes = []
+                if len(rows) < len(picked):
+                    notes.append("Duplicates were left out – the same job was already scored from another portal.")
+                if any(r["reason"] == "title" for r in rows):
+                    notes.append("Some were dropped by the **title filter** – it only learns from the *Skip titles "
+                                 "with* list above, so check which word matched.")
+                st.session_state.skip_notes = notes
+                st.rerun()
+            if b2.button("Remove mark", width="stretch", disabled=picked.empty or not set(picked["id"]) & marked):
+                backend.unmark_interested([i for i in picked["id"] if i in marked])
+                d["feedback"] = load_feedback(backend)
+                st.rerun()
+        for note in st.session_state.pop("skip_notes", []):
+            st.info(note)
+        if marked:
+            st.caption(f"★ {len(marked)} marked as interested so far – used by the AI pre-filter on every scan.")
     if not queue.empty:
         with st.expander(f"Queue ({len(queue)})"):
             st.dataframe(queue[["title", "company", "source", "url"]], hide_index=True, width="stretch",

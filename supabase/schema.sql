@@ -120,6 +120,19 @@ create table if not exists effective_settings (
   updated_at timestamptz default now()
 );
 
+-- offers you marked "interested" after the scanner skipped them (written by the web app). The scanner scores
+-- them on its next run and shows the AI pre-filter these titles as examples of offers to keep.
+create table if not exists feedback (
+  id        text primary key,
+  source    text,
+  title     text,
+  company   text,
+  location  text,
+  url       text,
+  reason    text,
+  marked_at timestamptz default now()
+);
+
 alter table offers       enable row level security;
 alter table runs         enable row level security;
 alter table queue        enable row level security;
@@ -127,6 +140,7 @@ alter table skipped      enable row level security;
 alter table applications enable row level security;
 alter table settings     enable row level security;
 alter table effective_settings enable row level security;
+alter table feedback     enable row level security;
 
 -- read: any logged-in user (sign-ups are disabled, so that's only you)
 drop policy if exists "read offers" on offers;             create policy "read offers"   on offers   for select to authenticated using (true);
@@ -136,4 +150,5 @@ drop policy if exists "read skipped" on skipped;           create policy "read s
 drop policy if exists "read effective" on effective_settings; create policy "read effective" on effective_settings for select to authenticated using (true);
 -- read + write: your own data
 drop policy if exists "own applications" on applications;  create policy "own applications" on applications for all to authenticated using (true) with check (true);
+drop policy if exists "own feedback" on feedback;          create policy "own feedback"     on feedback     for all to authenticated using (true) with check (true);
 drop policy if exists "own settings" on settings;          create policy "own settings"     on settings     for all to authenticated using (true) with check (true);
