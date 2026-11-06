@@ -23,22 +23,62 @@ class AppTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def run_app(self):
+    def run_app(self, page: str = "home"):
         from streamlit.testing.v1 import AppTest
-        with mock.patch.dict(os.environ, {"APP_BACKEND": "local", "LOCAL_DB": self.db}):
+        with mock.patch.dict(os.environ, {"APP_BACKEND": "local", "LOCAL_DB": self.db, "APP_START_PAGE": page}):
             at = AppTest.from_file(str(APP), default_timeout=60).run()
         return at
 
-    def test_all_tabs_render_without_errors(self):
-        at = self.run_app()
-        self.assertFalse(at.exception, [e.value for e in at.exception])
-        self.assertEqual([t.label for t in at.tabs], ["Offers", "My applications", "Scanner", "Market"])
-        self.assertTrue(any("offers" in c.value for c in at.caption))
+    def test_every_page_renders_without_errors(self):
+        for page in ("home", "offers", "applications", "scanner", "market"):
+            with self.subTest(page=page):
+                at = self.run_app(page)
+                self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertTrue(any("offers" in c.value for c in at.sidebar.caption))
+
+    def test_home_summary(self):
+        at = self.run_app("home")
+        labels = [m.label for m in at.metric]
+        self.assertIn("New offers (24 h)", labels)
+        self.assertIn("Follow-ups due", labels)
+        self.assertIn("Scanner", labels)
+
+    def test_scanner_page(self):
+        at = self.run_app("scanner")
         self.assertTrue(any(m.label == "Waiting in queue" and m.value == "2" for m in at.metric))
+
+    def test_quick_status_buttons(self):
+        from datetime import date, timedelta
+        from data import LocalBackend
+        from streamlit.testing.v1 import AppTest
+        with mock.patch.dict(os.environ, {"APP_BACKEND": "local", "LOCAL_DB": self.db, "APP_START_PAGE": "offers"}):
+            at = AppTest.from_file(str(APP), default_timeout=60).run()
+            at.button[[b.label for b in at.button].index("Details")].click().run()   # open the best offer
+            self.assertFalse(at.exception, [e.value for e in at.exception])
+            applied = next(b for b in at.button if b.label == "✓ Applied" and b.key.startswith("applied-detail-"))
+            offer_id = applied.key.removeprefix("applied-detail-")
+            applied.click().run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        row = LocalBackend(self.db).applications().set_index("offer_id").loc[offer_id]
+        self.assertEqual(row.status, "applied")
+        self.assertEqual(row.applied_on, date.today().isoformat())
+        self.assertEqual(row.follow_up_on, (date.today() + timedelta(days=7)).isoformat())
+
+    def test_kanban_moves_to_next_stage(self):
+        from data import LocalBackend
+        from streamlit.testing.v1 import AppTest
+        LocalBackend(self.db).save_application("demo-3", status="saved")
+        with mock.patch.dict(os.environ, {"APP_BACKEND": "local", "LOCAL_DB": self.db,
+                                          "APP_START_PAGE": "applications"}):
+            at = AppTest.from_file(str(APP), default_timeout=60).run()
+            self.assertFalse(at.exception, [e.value for e in at.exception])
+            next(b for b in at.button if b.key == "nx-demo-3").click().run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertEqual(LocalBackend(self.db).applications().set_index("offer_id").loc["demo-3"].status, "applied")
 
     def test_settings_saved_from_the_form(self):
         from data import LocalBackend
-        with mock.patch.dict(os.environ, {"APP_BACKEND": "local", "LOCAL_DB": self.db}):
+        with mock.patch.dict(os.environ, {"APP_BACKEND": "local", "LOCAL_DB": self.db, "APP_START_PAGE": "scanner"}):
             from streamlit.testing.v1 import AppTest
             at = AppTest.from_file(str(APP), default_timeout=60).run()
             kw = next(t for t in at.text_area if t.label.startswith("Keywords"))
@@ -115,12 +155,14 @@ class EmptySupabaseTests(unittest.TestCase):
         from data import SupabaseBackend
         from streamlit.testing.v1 import AppTest
         env = {k: v for k, v in os.environ.items() if k not in ("APP_BACKEND", "LOCAL_DB")}
-        with mock.patch.dict(os.environ, env, clear=True):
-            at = AppTest.from_file(str(APP), default_timeout=60)
-            at.session_state["backend"] = SupabaseBackend(FakeClient({}))
-            at.run()
-        self.assertFalse(at.exception, [e.value for e in at.exception])
-        texts = " ".join(i.value for i in at.info)
+        texts = ""
+        for page in ("home", "offers", "applications", "scanner", "market"):
+            with mock.patch.dict(os.environ, {**env, "APP_START_PAGE": page}, clear=True):
+                at = AppTest.from_file(str(APP), default_timeout=60)
+                at.session_state["backend"] = SupabaseBackend(FakeClient({}))
+                at.run()
+            self.assertFalse(at.exception, [page] + [e.value for e in at.exception])
+            texts += " ".join(i.value for i in at.info)
         self.assertIn("No offers yet", texts)
         self.assertIn("No applications tracked yet", texts)
 
@@ -129,12 +171,14 @@ class EmptySupabaseTests(unittest.TestCase):
         from data import SupabaseBackend
         from streamlit.testing.v1 import AppTest
         env = {k: v for k, v in os.environ.items() if k not in ("APP_BACKEND", "LOCAL_DB")}
-        with mock.patch.dict(os.environ, env, clear=True):
-            at = AppTest.from_file(str(APP), default_timeout=60)
-            at.session_state["backend"] = SupabaseBackend(FakeClient(
-                {"applications": [{"offer_id": "x", "status": "applied", "applied_on": "2026-11-01"}]}))
-            at.run()
-        self.assertFalse(at.exception, [e.value for e in at.exception])
+        for page in ("home", "applications"):
+            with mock.patch.dict(os.environ, {**env, "APP_START_PAGE": page}, clear=True):
+                at = AppTest.from_file(str(APP), default_timeout=60)
+                at.session_state["backend"] = SupabaseBackend(FakeClient(
+                    {"applications": [{"offer_id": "x", "status": "applied", "applied_on": "2026-11-01",
+                                       "follow_up_on": "2026-11-02"}]}))
+                at.run()
+            self.assertFalse(at.exception, [page] + [e.value for e in at.exception])
 
 
 class MissingValuesTests(unittest.TestCase):
