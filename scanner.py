@@ -23,7 +23,8 @@ import re
 import smtplib
 import sys
 import time
-from datetime import date, datetime
+import math
+from datetime import date, datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -619,7 +620,15 @@ def main() -> None:
         print("Today's main run already happened - backup run skipped")
         close_db(store)
         return
-    stats = {"started_at": now_iso()}
+    if not os.getenv("HOURS"):  # scheduled run: look back to the last full scan, so a skipped day loses nothing
+        last = store.last_full_scan_start()
+        if last:
+            gap = math.ceil((datetime.now(timezone.utc) - last).total_seconds() / 3600) + 2  # 2 h overlap
+            cap = int(cfg.get("max_lookback_hours", 96))
+            cfg["posted_within_hours"] = min(max(int(cfg["posted_within_hours"]), gap), cap)
+            if cfg["posted_within_hours"] > 26:
+                print(f"Last full scan {gap - 2} h ago - looking back {cfg['posted_within_hours']} h")
+    stats = {"started_at": now_iso(), "window_hours": int(cfg["posted_within_hours"])}
     USAGE.update(gemini_calls=0, gemini_errors=0, tokens_in=0, tokens_out=0)
     DEAD_MODELS.clear()
     t0 = time.monotonic()

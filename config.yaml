@@ -16,6 +16,10 @@ sources: [linkedin, pracuj, nofluffjobs, justjoin, rocketjobs]
 # Only offers posted in the last N hours
 posted_within_hours: 24
 
+# Scheduled runs look back to the last full scan (+2 h overlap) when that was longer ago than
+# posted_within_hours - so a day GitHub skips loses nothing. Never further back than this:
+max_lookback_hours: 96
+
 # How many result pages (25 offers each) to read per search
 pages_per_search: 1
 
