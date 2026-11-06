@@ -137,10 +137,10 @@ def explode_count(series: pd.Series, n: int = 12) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- pages
 def page_offers(backend, d):
-    offers = with_status(d["offers"], d["apps"])
-    if offers.empty:
-        st.info("No offers yet – they appear after the next scan.")
+    if d["offers"].empty:
+        st.info("No offers yet – they appear after the next scan syncs to the app.")
         return
+    offers = with_status(d["offers"], d["apps"])
     threshold = int(current(d).get("min_score_to_notify", 60))
     f1, f2, f3, f4 = st.columns([3, 2, 2, 2])
     query = f1.text_input("Search", placeholder="title, company or skill…", label_visibility="collapsed")
@@ -249,8 +249,8 @@ def page_applications(backend, d):
     for c, s in zip(cols, STATUSES):
         c.metric(s.capitalize(), int(counts.get(s, 0)))
 
-    due = df[(df["status"].isin(["applied", "interview"])) & df["follow_up_on"].notna() &
-             (df["follow_up_on"] <= date.today())]
+    follow_ts = pd.to_datetime(df["follow_up_on"], errors="coerce")  # works even when every date is empty
+    due = df[(df["status"].isin(["applied", "interview"])) & (follow_ts <= pd.Timestamp(date.today()))]
     if not due.empty:
         st.warning("**Follow-ups due:** " + "; ".join(f"{r.title} ({r.company})" for r in due.itertuples()))
 

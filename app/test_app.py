@@ -107,3 +107,31 @@ class SupabaseBackendTests(unittest.TestCase):
         upsert = next(a for n, a, k in c.calls[-1][1] if n == "upsert")[0]
         self.assertEqual((upsert["offer_id"], upsert["status"]), ("7", "applied"))
         self.assertNotIn("bogus", upsert)
+
+
+class EmptySupabaseTests(unittest.TestCase):
+    """A fresh Supabase project before the first sync: every table empty (they come back without columns)."""
+    def test_app_renders_with_empty_tables(self):
+        from data import SupabaseBackend
+        from streamlit.testing.v1 import AppTest
+        env = {k: v for k, v in os.environ.items() if k not in ("APP_BACKEND", "LOCAL_DB")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            at = AppTest.from_file(str(APP), default_timeout=60)
+            at.session_state["backend"] = SupabaseBackend(FakeClient({}))
+            at.run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        texts = " ".join(i.value for i in at.info)
+        self.assertIn("No offers yet", texts)
+        self.assertIn("No applications tracked yet", texts)
+
+    def test_applications_without_their_offers(self):
+        """An application whose offer isn't synced yet must not break the tracker."""
+        from data import SupabaseBackend
+        from streamlit.testing.v1 import AppTest
+        env = {k: v for k, v in os.environ.items() if k not in ("APP_BACKEND", "LOCAL_DB")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            at = AppTest.from_file(str(APP), default_timeout=60)
+            at.session_state["backend"] = SupabaseBackend(FakeClient(
+                {"applications": [{"offer_id": "x", "status": "applied", "applied_on": "2026-11-01"}]}))
+            at.run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])

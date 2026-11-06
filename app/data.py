@@ -19,6 +19,28 @@ STATUSES = ["saved", "applied", "interview", "offer", "rejected", "not intereste
 SETTING_KEYS = ["keywords", "locations", "include_title_keywords", "exclude_title_keywords", "min_score_to_notify"]
 JSON_COLUMNS = ["strengths", "gaps", "contract_types", "required_tools", "nice_to_have_tools"]
 APP_COLUMNS = ["offer_id", "status", "applied_on", "follow_up_on", "notes", "updated_at"]
+# columns each table has - used so an empty table (fresh Supabase, before the first sync) still has them
+COLUMNS = {
+    "offers": ["id", "source", "first_seen", "title", "company", "location", "url", "search_keyword", "score",
+               "verdict", "seniority", "one_line_reason", "strengths", "gaps", "notified", "role_category", "industry",
+               "work_mode", "contract_types", "salary_min", "salary_max", "salary_currency", "salary_period",
+               "salary_type", "salary_min_pln_month", "salary_max_pln_month", "years_required", "english_level",
+               "polish_required", "required_tools", "nice_to_have_tools", "model"],
+    "runs": ["run_id", "started_at", "finished_at", "window_hours", "cards_found", "filtered_title", "new_offers",
+             "triaged_out", "scored", "failed", "notified", "queued", "stopped_by_time", "gemini_calls",
+             "gemini_errors", "sources", "model"],
+    "queue": ["id", "source", "title", "company", "location", "url", "queued_at"],
+    "skipped": ["id", "source", "title", "company", "location", "url", "reason", "skipped_at"],
+    "applications": APP_COLUMNS,
+}
+
+
+def _frame(rows: list[dict], table: str) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    for c in COLUMNS.get(table, []):
+        if c not in df:
+            df[c] = pd.Series(dtype="object")
+    return df
 
 
 def _now() -> str:
@@ -32,6 +54,7 @@ def _tidy_offers(df: pd.DataFrame) -> pd.DataFrame:
         if c in df:
             df[c] = df[c].apply(lambda v: v if isinstance(v, list) else (json.loads(v) if v else []))
     df["first_seen"] = pd.to_datetime(df["first_seen"], utc=True, errors="coerce")
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
     df["notified"] = df["notified"].fillna(False).astype(bool)
     return df
 
@@ -53,7 +76,7 @@ class SupabaseBackend:
             if len(batch) < self.PAGE:
                 break
             start += self.PAGE
-        return pd.DataFrame(rows)
+        return _frame(rows, table)
 
     def offers(self):
         return _tidy_offers(self._all("offers", "first_seen"))
@@ -72,8 +95,7 @@ class SupabaseBackend:
         return self._all("skipped", "skipped_at")
 
     def applications(self):
-        df = self._all("applications")
-        return df if not df.empty else pd.DataFrame(columns=APP_COLUMNS)
+        return self._all("applications")
 
     def save_application(self, offer_id: str, **fields) -> None:
         row = {"offer_id": offer_id, **{k: v for k, v in fields.items() if k in APP_COLUMNS}, "updated_at": _now()}
@@ -119,7 +141,7 @@ class LocalBackend:
 
     def queue(self):
         rows = [json.loads(r[0]) | {"queued_at": r[1]} for r in self.con.execute("SELECT offer, queued_at FROM queue")]
-        return pd.DataFrame(rows)
+        return _frame(rows, "queue")
 
     def skipped(self):
         df = self._df("SELECT id, source, title, company, location, url, COALESCE(reason, 'ai') AS reason, "
