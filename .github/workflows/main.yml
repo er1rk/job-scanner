@@ -14,8 +14,8 @@ on:
         description: "Offers posted within the last N hours (72 = 3 days)"
         default: "24"
       min_score:
-        description: "Minimum score to include in the e-mail"
-        default: "60"
+        description: "Minimum score to include in the e-mail (empty = settings)"
+        default: ""
       ignore_seen:
         description: "Re-score offers already seen before"
         type: boolean
@@ -63,6 +63,9 @@ jobs:
       - name: Offline tests
         run: python -m unittest -q
 
+      - name: Web app tests
+        run: pip install -q -r app/requirements.txt && python -m unittest -q app/test_app.py
+
       # One-off migration: restore the old seen.json cache (if any) so already-scored
       # offers are not scored again. Harmless once the database exists.
       - uses: actions/cache/restore@v4
@@ -85,6 +88,8 @@ jobs:
           CANDIDATE_PROFILE: ${{ secrets.CANDIDATE_PROFILE }}
           PRIVATE_CONFIG: ${{ secrets.PRIVATE_CONFIG }}
           DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           HOURS: ${{ inputs.auto && 'auto' || inputs.hours }}

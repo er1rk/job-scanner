@@ -34,6 +34,7 @@ import yaml
 import report
 import sources
 from sources import common
+import supabase_sync
 from storage import Store, decrypt_file, encrypt_file, now_iso
 
 ROOT = Path(__file__).parent
@@ -674,6 +675,17 @@ def main() -> None:
         close_db(store)
         return
 
+    # Search settings edited in the web app (Supabase) win over config files; manual inputs win over both
+    sb_url, sb_key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY")
+    if sb_url and sb_key and not args.dry_run:
+        try:
+            app_settings = supabase_sync.load_settings(sb_url, sb_key)
+            cfg.update(app_settings)
+            if app_settings:
+                print(f"Settings from the web app: {', '.join(sorted(app_settings))}")
+        except Exception as e:
+            print(f"Could not read settings from Supabase ({type(e).__name__}) - using config files")
+
     # Optional overrides for manual test runs (set from the "Run workflow" form)
     manual_hours = os.getenv("HOURS", "") not in ("", "auto")  # "auto" = external trigger, like a schedule
     if manual_hours:
@@ -862,6 +874,12 @@ def main() -> None:
                     "notified": len(good), "model": cfg.get("_last_model"),
                     "queued": waiting, "queue_expired": expired, "triaged_out": len(triaged_out),
                     "stopped_by_time": stopped_by_time, **timing, **USAGE})
+    if sb_url and sb_key:
+        try:
+            counts = supabase_sync.sync(store, sb_url, sb_key, cfg)
+            print("Supabase sync: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+        except Exception as e:  # the app just shows slightly older data - never fail the scan for it
+            print(f"Supabase sync failed: {str(e)[:200]}", file=sys.stderr)
     close_db(store)
     if email_error:
         sys.exit(f"Run finished and saved, but the e-mail failed: {email_error}")
