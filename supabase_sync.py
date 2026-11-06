@@ -13,6 +13,7 @@ bypasses Row Level Security - it lives only in GitHub Secrets. A failing sync ne
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -35,9 +36,22 @@ RUN_COLUMNS = [
 ]
 
 
+def normalise_url(url: str) -> str:
+    """Forgive the usual copy-paste slips in the SUPABASE_URL secret: quotes, spaces, a missing https://,
+    a trailing /rest/v1, or just the project id ("abcd1234" -> https://abcd1234.supabase.co)."""
+    u = (url or "").strip().strip("'\"").strip().rstrip("/")
+    u = re.sub(r"/rest/v1$", "", u)
+    if re.fullmatch(r"[a-z0-9]{15,30}", u):
+        u = f"{u}.supabase.co"
+    if not re.match(r"https?://", u):
+        u = "https://" + u
+    return u
+
+
 class Supabase:
     def __init__(self, url: str, key: str):
-        self.base = url.rstrip("/") + "/rest/v1"
+        self.base = normalise_url(url) + "/rest/v1"
+        key = (key or "").strip().strip("'\"").strip()
         self.headers = {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
     def _call(self, method: str, path: str, **kw) -> requests.Response:
