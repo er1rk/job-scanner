@@ -845,3 +845,56 @@ class LookbackWindowTests(unittest.TestCase):
             self.seed(tmp, [(49.5, 24)])
             self.run_main(tmp, [], {"HOURS": "1"})
             self.assertEqual(self.last_window(tmp), 1)
+
+
+class RealEmailPathTests(unittest.TestCase):
+    """Goes through send_email/send_html for real (only the SMTP server is faked) - this would have caught
+    the missing send_html that a mocked send_email hid."""
+    run_main = EndToEndTests.run_main
+
+    def test_digest_is_actually_sent(self):
+        offer = {"id": "1", "title": "Data Analyst", "company": "Acme", "location": "Warszawa", "url": "https://x",
+                 "source": "pracuj", **GEMINI_RESULT}
+        with mock.patch.object(scanner.smtplib, "SMTP_SSL") as smtp, \
+             mock.patch.dict(os.environ, {"EMAIL_ADDRESS": "me@example.com", "EMAIL_APP_PASSWORD": "pw"}):
+            scanner.send_email([offer], "id,title\n1,x\n", "", 2, 3, 40, 60)
+        msg = smtp.return_value.__enter__.return_value.send_message.call_args.args[0]
+        self.assertIn("1 offers, best 82/100", msg["Subject"])
+        self.assertEqual(msg["To"], "me@example.com")
+        self.assertIn("View offer", msg.get_body(("html",)).get_content())
+        self.assertEqual([a.get_filename() for a in msg.iter_attachments()][0][:5], "jobs_")
+
+    def test_weekly_report_is_actually_sent(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(scanner.smtplib, "SMTP_SSL") as smtp, \
+             mock.patch.dict(os.environ, {"EMAIL_ADDRESS": "me@example.com", "EMAIL_APP_PASSWORD": "pw"}):
+            st = Store(Path(tmp) / "jobs.db")
+            scanner.send_weekly_report(st, {"min_score_to_notify": 60}, None, None, None)
+            st.close()
+        msg = smtp.return_value.__enter__.return_value.send_message.call_args.args[0]
+        self.assertIn("Weekly job market report", msg["Subject"])
+
+    def test_email_failure_keeps_results_and_fails_the_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(scanner, "send_html", side_effect=OSError("smtp down")):
+                with self.assertRaises(SystemExit) as ex:
+                    # the real send_email runs; only its SMTP step (send_html) fails
+                    cfg = scanner.load_config()
+                    cfg.update(attach_csv_weekdays=[], report_weekdays=[], sources=["linkedin"], email_every_run=True)
+                    def fake_get(url, retries=3, **kw):
+                        return DETAIL_HTML if "jobPosting/" in url else SEARCH_HTML
+                    with mock.patch.object(scanner, "DB_FILE", Path(tmp) / "jobs.db"), \
+                         mock.patch.object(scanner, "SEEN_FILE", Path(tmp) / "seen.json"), \
+                         mock.patch.object(scanner, "DB_ENC_FILE", Path(tmp) / "jobs.db.enc"), \
+                         mock.patch.object(common, "get", side_effect=fake_get), \
+                         mock.patch.object(scanner.requests, "post", side_effect=fake_gemini), \
+                         mock.patch("time.sleep"), mock.patch.object(scanner, "load_config", return_value=cfg), \
+                         mock.patch.object(sys, "argv", ["scanner.py"]), \
+                         mock.patch.dict(os.environ, {"GEMINI_API_KEY": "x", "CANDIDATE_PROFILE": "p",
+                                                      "GITHUB_ACTIONS": "", "DB_ENCRYPTION_KEY": ""}):
+                        scanner.main()
+            self.assertIn("e-mail failed", str(ex.exception))
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual(store.count(), 1)                                   # scoring kept
+            self.assertEqual(store.con.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)
+            self.assertEqual(store.con.execute("SELECT notified FROM offers").fetchone()[0], 0)  # not marked sent
+            store.close()
