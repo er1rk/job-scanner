@@ -78,14 +78,29 @@ def load(backend, force: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------- helpers
+def clean(v):
+    """None for any kind of missing value (None, NaN, NA) - lists and dicts are kept as they are."""
+    if isinstance(v, (list, dict)):
+        return v
+    try:
+        return None if pd.isna(v) else v
+    except (TypeError, ValueError):
+        return v
+
+
 def salary(r) -> str:
-    lo, hi = r.get("salary_min"), r.get("salary_max")
-    if pd.isna(lo) and pd.isna(hi):
+    lo, hi = clean(r.get("salary_min")), clean(r.get("salary_max"))
+    if lo is None and hi is None:
         return ""
-    lo = hi if pd.isna(lo) else lo
-    hi = lo if pd.isna(hi) else hi
-    rng = f"{lo:,.0f}" if lo == hi else f"{lo:,.0f}–{hi:,.0f}"
-    return f"{rng.replace(',', ' ')} {r.get('salary_currency') or ''}/{(r.get('salary_period') or 'month')[:2]}".strip()
+    lo = hi if lo is None else lo
+    hi = lo if hi is None else hi
+    try:
+        rng = f"{float(lo):,.0f}" if lo == hi else f"{float(lo):,.0f}–{float(hi):,.0f}"
+    except (TypeError, ValueError):
+        return ""
+    cur = clean(r.get("salary_currency")) or ""
+    per = str(clean(r.get("salary_period")) or "month")[:2]
+    return f"{rng.replace(',', ' ')} {cur}/{per}".replace("  ", " ").strip()
 
 
 def current(d: dict) -> dict:
@@ -196,14 +211,16 @@ def offer_detail(backend, o, d):
     with st.container(border=True):
         a, b = st.columns([5, 1])
         a.subheader(o["title"])
-        a.markdown(f"{o['company']} · {o['location']} · {o['portal']} · [open offer ↗]({o['url']})")
+        a.markdown(" · ".join(str(x) for x in (clean(o.get("company")), clean(o.get("location")), clean(o.get("portal")))
+                              if x) + (f" · [open offer ↗]({o['url']})" if clean(o.get("url")) else ""))
         b.metric("Score", int(o["score"]) if pd.notna(o["score"]) else "–")
-        facts = [x for x in (o["salary"], o.get("work_mode"), ", ".join(o.get("contract_types") or []),
-                             f"EN {o['english_level']}" if o.get("english_level") not in (None, "unknown") else "")
+        en = clean(o.get("english_level"))
+        facts = [x for x in (o["salary"], clean(o.get("work_mode")), ", ".join(clean(o.get("contract_types")) or []),
+                             f"EN {en}" if en not in (None, "unknown", "none") else "")
                  if x and x != "unknown"]
         if facts:
             st.markdown(" · ".join(f"`{x}`" for x in facts))
-        st.write(o.get("one_line_reason") or "")
+        st.write(clean(o.get("one_line_reason")) or "")
         c1, c2 = st.columns(2)
         c1.markdown("**Strengths**\n" + "\n".join(f"- ✓ {x}" for x in o["strengths"]) if o["strengths"] else "")
         c2.markdown("**Gaps**\n" + "\n".join(f"- ✗ {x}" for x in o["gaps"]) if o["gaps"] else "")

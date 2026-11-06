@@ -40,6 +40,8 @@ def _frame(rows: list[dict], table: str) -> pd.DataFrame:
     for c in COLUMNS.get(table, []):
         if c not in df:
             df[c] = pd.Series(dtype="object")
+    if table in ("queue", "skipped", "applications"):
+        df = _text_none(df, [c for c in df.columns if c not in ("applied_on", "follow_up_on")])
     return df
 
 
@@ -47,9 +49,23 @@ def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+TEXT_COLUMNS = ["source", "title", "company", "location", "url", "search_keyword", "verdict", "seniority",
+                "one_line_reason", "role_category", "industry", "work_mode", "salary_currency", "salary_period",
+                "salary_type", "english_level", "model"]
+
+
+def _text_none(df: pd.DataFrame, cols) -> pd.DataFrame:
+    """pandas 3 keeps missing text as NaN (a float, and truthy) - turn it back into None so `x or default` works."""
+    for c in cols:
+        if c in df:
+            df[c] = df[c].astype(object).where(df[c].notna(), None)
+    return df
+
+
 def _tidy_offers(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+    df = _text_none(df, TEXT_COLUMNS)
     for c in JSON_COLUMNS:
         if c in df:
             df[c] = df[c].apply(lambda v: v if isinstance(v, list) else (json.loads(v) if v else []))
