@@ -135,3 +135,51 @@ class EmptySupabaseTests(unittest.TestCase):
                 {"applications": [{"offer_id": "x", "status": "applied", "applied_on": "2026-11-01"}]}))
             at.run()
         self.assertFalse(at.exception, [e.value for e in at.exception])
+
+
+class MissingValuesTests(unittest.TestCase):
+    """Real offers often lack some fields (salary without period/currency, no work mode...). pandas 3 turns
+    missing text into NaN, which crashed the Offers page on Streamlit Cloud."""
+    OFFERS = [
+        {"id": "a", "source": "pracuj", "title": "KYC Analyst", "company": "Bank", "location": None, "url": "https://x",
+         "first_seen": "2099-01-01T06:00:00+00:00", "score": 80, "notified": True, "salary_min": 9000,
+         "salary_max": None, "salary_currency": None, "salary_period": None, "work_mode": None, "english_level": None,
+         "one_line_reason": None, "strengths": ["Excel"], "gaps": [], "contract_types": None, "required_tools": [],
+         "nice_to_have_tools": [], "role_category": "fraud/AML/KYC/compliance"},
+        {"id": "b", "source": "linkedin", "title": "Data Analyst", "company": None, "location": "Kraków",
+         "url": "https://y", "first_seen": "2099-01-01T05:00:00+00:00", "score": 70, "notified": True,
+         "salary_min": 8000, "salary_max": 11000, "salary_currency": "PLN", "salary_period": "month",
+         "work_mode": "hybrid", "english_level": "B2", "one_line_reason": "Good fit.", "strengths": [], "gaps": ["SQL"],
+         "contract_types": ["B2B"], "required_tools": ["SQL"], "nice_to_have_tools": [], "role_category": "data/BI analytics"},
+    ]
+
+    def test_salary_and_tidy_with_missing_fields(self):
+        import pandas as pd
+        from data import SupabaseBackend
+        with pd.option_context("future.infer_string", True):  # the default in pandas 3
+            df = SupabaseBackend(FakeClient({"offers": self.OFFERS})).offers()
+            self.assertIsNone(df.set_index("id").loc["a", "salary_period"])          # NaN -> None
+        self.assertEqual(streamlit_app_salary(df.set_index("id").loc["a"]), "9 000 /mo")
+        self.assertEqual(streamlit_app_salary(df.set_index("id").loc["b"]), "8 000–11 000 PLN/mo")
+
+    def test_offers_page_renders_with_missing_fields(self):
+        from data import SupabaseBackend
+        from streamlit.testing.v1 import AppTest
+        env = {k: v for k, v in os.environ.items() if k not in ("APP_BACKEND", "LOCAL_DB")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            at = AppTest.from_file(str(APP), default_timeout=60)
+            at.session_state["backend"] = SupabaseBackend(FakeClient({"offers": self.OFFERS}))
+            at.run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertTrue(any("2 offers" in c.value for c in at.caption))
+
+
+def streamlit_app_salary(row):
+    """Load just the salary helper from the app file without running the page."""
+    import ast
+    src = APP.read_text()
+    tree = ast.parse(src)
+    funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("clean", "salary")]
+    ns = {"pd": __import__("pandas")}
+    exec(compile(ast.Module(body=funcs, type_ignores=[]), "app", "exec"), ns)
+    return ns["salary"](row)
