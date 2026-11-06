@@ -6,6 +6,8 @@ Local: APP_BACKEND=local LOCAL_DB=data/jobs.db streamlit run app/streamlit_app.p
 
 from __future__ import annotations
 
+import hashlib
+import html
 import os
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -150,26 +152,187 @@ def explode_count(series: pd.Series, n: int = 12) -> pd.DataFrame:
     return out
 
 
+# ---------------------------------------------------------------- look & feel
+CSS = """
+<style>
+.block-container {padding-top: 4.2rem; max-width: 1240px;}
+.jc-label {font-size: 12px; font-weight: 600; margin-bottom: 1px;}
+.jc-title {font-size: 15px; font-weight: 600; line-height: 1.3; color: #1f1f1e;}
+.jc-meta {font-size: 13px; color: #52514e; margin-top: 2px;}
+.jc-chip {display: inline-block; font-size: 12px; color: #52514e; background: #f1efeb; border-radius: 10px;
+          padding: 2px 9px; margin: 6px 4px 0 0; white-space: nowrap;}
+.jc-status {display: inline-block; font-size: 11px; font-weight: 600; border-radius: 10px; padding: 2px 8px;
+            background: #e7f1fb; color: #1d5fae; margin-left: 6px; vertical-align: 2px;}
+.jc-ring {width: 44px; height: 44px; line-height: 38px; border-radius: 22px; border: 3px solid; text-align: center;
+          font-size: 16px; font-weight: 700; float: right; margin-left: 10px;}
+.jc-ring.big {width: 58px; height: 58px; line-height: 52px; border-radius: 29px; font-size: 20px;}
+.jc-reason {font-size: 14px; line-height: 1.5; color: #1f1f1e; margin: 10px 0 6px;}
+.jc-list div {font-size: 13px; line-height: 1.45; color: #52514e; padding-left: 16px; text-indent: -16px; margin: 2px 0;}
+.jc-kanban-head {font-size: 13px; font-weight: 600; color: #52514e; text-transform: uppercase; letter-spacing: .03em;}
+.jc-due {color: #b42318; font-weight: 600;}
+div[class*="st-key-sel-"] {border-color: #2a78d6 !important; box-shadow: 0 0 0 1px #2a78d6;}
+@media (max-width: 640px) {
+  .block-container {padding-left: 1rem; padding-right: 1rem; padding-top: 3.6rem;}
+  /* phone: show the selected offer's details ABOVE the list */
+  .st-key-offers-layout div[data-testid="stHorizontalBlock"] {flex-direction: column-reverse;}
+  .st-key-offers-layout div[data-testid="stHorizontalBlock"] div[data-testid="stHorizontalBlock"] {flex-direction: column;}
+  /* phone: summary numbers as a 2 x 2 grid instead of four rows */
+  .st-key-kpis div[data-testid="stHorizontalBlock"] {flex-direction: row; flex-wrap: wrap; gap: .5rem 0;}
+  .st-key-kpis div[data-testid="stColumn"] {min-width: 50% !important; flex: 1 1 50% !important;}
+  .st-key-kpis div[data-testid="stMetricValue"] {font-size: 1.6rem;}
+  .jc-ring {width: 38px; height: 38px; line-height: 32px; font-size: 14px;}
+}
+</style>
+"""
+GOOD, AMBER, LOW = "#1a7f37", "#9a6700", "#8a8984"
+STATUS_LABEL = {"saved": "Saved", "applied": "Applied", "interview": "Interview", "offer": "Offer",
+                "rejected": "Rejected", "not interested": "Not interested"}
+
+
+def tier(score, threshold):
+    s = clean(score) or 0
+    if s >= max(75, threshold):
+        return GOOD, "Strong match"
+    if s >= threshold:
+        return AMBER, "Worth a look"
+    return LOW, "Below threshold"
+
+
+def card_html(o, threshold: int, big: bool = False) -> str:
+    """Offer card body in the style of the e-mail digest (title, meta, score ring, fact chips)."""
+    col, label = tier(o.get("score"), threshold)
+    esc = lambda v: html.escape(str(v)) if clean(v) is not None else ""
+    status = clean(o.get("status"))
+    badge = f"<span class='jc-status'>{STATUS_LABEL.get(status, status)}</span>" if status else ""
+    meta = " · ".join(esc(x) for x in (o.get("company"), o.get("location"), o.get("portal")) if clean(x))
+    en = clean(o.get("english_level"))
+    chips = [o.get("salary"), clean(o.get("work_mode")) if clean(o.get("work_mode")) != "unknown" else None,
+             ", ".join(clean(o.get("contract_types")) or []) or None,
+             f"EN {en}" if en not in (None, "unknown", "none") else None]
+    chips_html = "".join(f"<span class='jc-chip'>{html.escape(c)}</span>" for c in chips if c)
+    score = int(clean(o.get("score")) or 0)
+    return (f"<div class='jc-ring{' big' if big else ''}' style='border-color:{col};color:{col}'>{score}</div>"
+            f"<div class='jc-label' style='color:{col}'>{label}{badge}</div>"
+            f"<div class='jc-title' style='font-size:{19 if big else 15}px'>{esc(o.get('title'))}</div>"
+            f"<div class='jc-meta'>{meta}</div><div>{chips_html}</div>")
+
+
+def set_status(backend, d, offer_id: str, status: str, **extra) -> None:
+    fields = {"status": status, **extra}
+    if status == "applied":
+        today = date.today()
+        fields.setdefault("applied_on", today.isoformat())
+        fields.setdefault("follow_up_on", (today + timedelta(days=7)).isoformat())  # reminder a week later
+    backend.save_application(offer_id, **fields)
+    d["apps"] = backend.applications()
+
+
+def quick_actions(backend, d, o, key: str) -> None:
+    """Save / Applied / Not interested in one tap."""
+    status = clean(o.get("status"))
+    a, b, c = st.columns(3)
+    if a.button("★ Save", key=f"save-{key}", width="stretch", disabled=status == "saved"):
+        set_status(backend, d, o["id"], "saved")
+        st.toast("Saved for later")
+        st.rerun()
+    if b.button("✓ Applied", key=f"applied-{key}", width="stretch", type="primary", disabled=status == "applied"):
+        set_status(backend, d, o["id"], "applied")
+        st.toast("Marked as applied – follow-up reminder in 7 days")
+        st.rerun()
+    if c.button("✕ Not interested", key=f"no-{key}", width="stretch", disabled=status == "not interested"):
+        set_status(backend, d, o["id"], "not interested")
+        st.toast("Hidden from the list")
+        st.rerun()
+
+
 # ---------------------------------------------------------------- pages
-def page_offers(backend, d):
+def page_home():
+    backend, d = APP["backend"], APP["data"]
+    offers = with_status(d["offers"], d["apps"]) if not d["offers"].empty else d["offers"]
+    threshold = int(current(d).get("min_score_to_notify", 60))
+    since = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=24)
+    fresh = offers[offers["first_seen"] >= since] if not offers.empty else offers
+    matches = fresh[fresh["score"].fillna(0) >= threshold] if not fresh.empty else fresh
+    apps = d["apps"]
+    follow = pd.to_datetime(apps["follow_up_on"], errors="coerce") if not apps.empty else pd.Series(dtype="datetime64[ns]")
+    due = apps[(apps["status"].isin(["applied", "interview"])) & (follow <= pd.Timestamp(date.today()))] if not apps.empty else apps
+    runs = d["runs"]
+    last = runs.iloc[0] if not runs.empty else None
+
+    st.markdown(f"### {datetime.now().strftime('%A')}, {date.today().day} {datetime.now().strftime('%B')}")
+    k1, k2, k3, k4 = st.container(key="kpis").columns(4)
+    k1.metric("New offers (24 h)", len(fresh))
+    k2.metric(f"New matches ≥ {threshold}", len(matches))
+    k3.metric("Follow-ups due", len(due))
+    if last is not None and pd.notna(last["finished_at"]):
+        hours = (pd.Timestamp.now(tz="UTC") - last["finished_at"]).total_seconds() / 3600
+        ok = hours < 26 and not (clean(last.get("gemini_errors")) or 0)
+        k4.metric("Scanner", f"{'✓' if ok else '⚠'} {hours:.0f} h ago" if hours >= 1 else "✓ just now",
+                  help=f"Last scan: {int(clean(last.get('scored')) or 0)} scored, "
+                       f"{int(clean(last.get('queued')) or 0)} queued, "
+                       f"{int(clean(last.get('gemini_errors')) or 0)} Gemini errors")
+        if hours >= 26:
+            st.warning("No scan in the last day – check the cron trigger or start one in **Scanner**.")
+    else:
+        k4.metric("Scanner", "no scans yet")
+
+    if not due.empty:
+        st.markdown("#### Follow-ups due")
+        names = offers.set_index("id") if not offers.empty else pd.DataFrame()
+        for r in due.itertuples():
+            o = names.loc[r.offer_id] if r.offer_id in names.index else {}
+            with st.container(border=True):
+                t, b1, b2 = st.columns([6, 2, 2], vertical_alignment="center")
+                applied = clean(r.applied_on)
+                t.markdown(f"**{html.escape(str(clean(o.get('title')) or r.offer_id))}** · {html.escape(str(clean(o.get('company')) or ''))}"
+                           f"  \n<span class='jc-meta'>{STATUS_LABEL.get(r.status)} {applied or ''} · follow-up "
+                           f"<span class='jc-due'>{clean(r.follow_up_on)}</span></span>", unsafe_allow_html=True)
+                if b1.button("Followed up +7 d", key=f"fu-{r.offer_id}", width="stretch"):
+                    set_status(backend, d, r.offer_id, r.status,
+                               follow_up_on=(date.today() + timedelta(days=7)).isoformat())
+                    st.rerun()
+                if b2.button("Rejected", key=f"rj-{r.offer_id}", width="stretch"):
+                    set_status(backend, d, r.offer_id, "rejected")
+                    st.rerun()
+
+    st.markdown("#### Best new matches")
+    top = matches[~matches["status"].isin(["applied", "interview", "offer", "rejected", "not interested"])] \
+        if not matches.empty else matches
+    if top.empty:
+        st.caption("Nothing new above the threshold in the last 24 hours.")
+    for _, o in top.sort_values("score", ascending=False).head(5).iterrows():
+        with st.container(border=True):
+            st.markdown(card_html(o, threshold), unsafe_allow_html=True)
+            st.markdown(f"<div class='jc-reason'>{html.escape(str(clean(o.get('one_line_reason')) or ''))}</div>",
+                        unsafe_allow_html=True)
+            quick_actions(backend, d, o, f"home-{o['id']}")
+            l1, l2 = st.columns(2)
+            if l1.button("Details →", key=f"det-{o['id']}", width="stretch"):
+                st.session_state.sel = o["id"]
+                st.switch_page(PAGES["offers"])
+            if clean(o.get("url")):
+                l2.link_button("Open offer ↗", o["url"], width="stretch")
+
+
+def page_offers():
+    backend, d = APP["backend"], APP["data"]
     if d["offers"].empty:
         st.info("No offers yet – they appear after the next scan syncs to the app.")
         return
     offers = with_status(d["offers"], d["apps"])
     threshold = int(current(d).get("min_score_to_notify", 60))
-    f1, f2, f3, f4 = st.columns([3, 2, 2, 2])
-    query = f1.text_input("Search", placeholder="title, company or skill…", label_visibility="collapsed")
-    days = f2.selectbox("Period", [1, 3, 7, 30, 3650], index=2,
-                        format_func=lambda v: "all time" if v > 365 else f"last {v} day{'s' if v > 1 else ''}",
-                        label_visibility="collapsed")
+    f1, f2, f3 = st.columns([3, 2, 2])
+    query = f1.text_input("Search", placeholder="Search title, company or skill…", label_visibility="collapsed")
+    days = f2.selectbox("Period", [1, 3, 7, 30, 3650], index=2, label_visibility="collapsed",
+                        format_func=lambda v: "All time" if v > 365 else f"Last {v} day{'s' if v > 1 else ''}")
     min_score = f3.slider("Min score", 0, 100, threshold, step=5, label_visibility="collapsed",
                           help="Minimum score")
-    hide = f4.toggle("Hide applied / rejected", value=True)
     with st.expander("More filters"):
-        g1, g2, g3 = st.columns(3)
+        g1, g2, g3, g4 = st.columns(4)
         portals = g1.multiselect("Portal", sorted(offers["portal"].dropna().unique()))
         cats = g2.multiselect("Category", sorted(offers["role_category"].dropna().unique()))
         modes = g3.multiselect("Work mode", sorted(offers["work_mode"].dropna().unique()))
+        hide = g4.toggle("Hide applied / rejected / not interested", value=True)
 
     df = offers[offers["first_seen"] >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)]
     df = df[df["score"].fillna(0) >= min_score]
@@ -184,128 +347,121 @@ def page_offers(backend, d):
             df = df[df[col].isin(sel)]
     df = df.sort_values(["score", "first_seen"], ascending=False)
 
-    st.caption(f"{len(df)} offers · sorted by score")
-    table = df[["score", "title", "company", "location", "portal", "salary", "status", "first_seen", "url"]]
-    event = st.dataframe(
-        table, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
-        height=min(38 * len(table) + 40, 520),
-        column_config={
-            "score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d", width="small"),
-            "title": st.column_config.TextColumn("Title", width="medium"),
-            "first_seen": st.column_config.DatetimeColumn("Found", format="D MMM, HH:mm", width="small"),
-            "url": st.column_config.LinkColumn("Link", display_text="Open ↗", width="small"),
-            "status": st.column_config.TextColumn("Status", width="small"),
-            "company": st.column_config.TextColumn("Company", width="medium"),
-            "location": st.column_config.TextColumn("Location", width="small"),
-            "portal": st.column_config.TextColumn("Portal", width="small"),
-            "salary": st.column_config.TextColumn("Salary", width="small"),
-        })
-    rows = event.selection.rows if event and event.selection else []
-    if not rows:
-        st.caption("Select a row to see the details and track your application.")
-        return
-    offer_detail(backend, df.iloc[rows[0]], d)
+    sel_id = st.session_state.get("sel")
+    with st.container(key="offers-layout"):
+        left, right = st.columns([5, 6], gap="medium")
+        with left:
+            shown = st.session_state.get("shown", 20)
+            st.caption(f"{len(df)} offers · best first")
+            for _, o in df.head(shown).iterrows():
+                key = ("sel-" if o["id"] == sel_id else "card-") + hashlib.md5(str(o["id"]).encode()).hexdigest()[:10]
+                with st.container(border=True, key=key):
+                    st.markdown(card_html(o, threshold), unsafe_allow_html=True)
+                    if st.button("Details", key=f"open-{o['id']}", width="stretch",
+                                 type="secondary" if o["id"] != sel_id else "primary"):
+                        st.session_state.sel = o["id"]
+                        st.rerun()
+            if len(df) > shown and st.button(f"Show more ({len(df) - shown} left)", width="stretch"):
+                st.session_state.shown = shown + 20
+                st.rerun()
+        with right:
+            pick = offers[offers["id"] == sel_id]
+            if pick.empty:
+                st.caption("Pick an offer to see why it scored what it did and to track it.")
+            else:
+                offer_detail(backend, pick.iloc[0], d, threshold)
 
 
-def offer_detail(backend, o, d):
+def offer_detail(backend, o, d, threshold: int):
     with st.container(border=True):
-        a, b = st.columns([5, 1])
-        a.subheader(o["title"])
-        a.markdown(" · ".join(str(x) for x in (clean(o.get("company")), clean(o.get("location")), clean(o.get("portal")))
-                              if x) + (f" · [open offer ↗]({o['url']})" if clean(o.get("url")) else ""))
-        b.metric("Score", int(o["score"]) if pd.notna(o["score"]) else "–")
-        en = clean(o.get("english_level"))
-        facts = [x for x in (o["salary"], clean(o.get("work_mode")), ", ".join(clean(o.get("contract_types")) or []),
-                             f"EN {en}" if en not in (None, "unknown", "none") else "")
-                 if x and x != "unknown"]
-        if facts:
-            st.markdown(" · ".join(f"`{x}`" for x in facts))
-        st.write(clean(o.get("one_line_reason")) or "")
+        st.markdown(card_html(o, threshold, big=True), unsafe_allow_html=True)
+        st.markdown(f"<div class='jc-reason'>{html.escape(str(clean(o.get('one_line_reason')) or ''))}</div>",
+                    unsafe_allow_html=True)
+        plus = "".join(f"<div><span style='color:{GOOD}'>✓</span> {html.escape(x)}</div>" for x in o["strengths"])
+        minus = "".join(f"<div><span style='color:#b42318'>✗</span> {html.escape(x)}</div>" for x in o["gaps"])
         c1, c2 = st.columns(2)
-        c1.markdown("**Strengths**\n" + "\n".join(f"- ✓ {x}" for x in o["strengths"]) if o["strengths"] else "")
-        c2.markdown("**Gaps**\n" + "\n".join(f"- ✗ {x}" for x in o["gaps"]) if o["gaps"] else "")
-        if o.get("required_tools"):
-            st.caption("Required tools: " + ", ".join(o["required_tools"]))
+        c1.markdown(f"<div class='jc-list'>{plus}</div>", unsafe_allow_html=True)
+        c2.markdown(f"<div class='jc-list'>{minus}</div>", unsafe_allow_html=True)
+        tools = clean(o.get("required_tools")) or []
+        if tools:
+            st.caption("Required tools: " + ", ".join(tools))
+        found = o["first_seen"].tz_convert("Europe/Warsaw").strftime("%d %b, %H:%M") if pd.notna(o["first_seen"]) else ""
+        st.caption(f"Found {found} · search “{clean(o.get('search_keyword')) or '–'}”")
+        quick_actions(backend, d, o, f"detail-{o['id']}")
+        if clean(o.get("url")):
+            st.link_button("Open offer ↗", o["url"], width="stretch")
 
         apps = d["apps"]
-        cur = apps[apps["offer_id"] == o["id"]].iloc[0].to_dict() if not apps.empty and (apps["offer_id"] == o["id"]).any() else {}
-        with st.form(f"track-{o['id']}"):
-            s1, s2, s3 = st.columns(3)
-            status = s1.selectbox("Status", STATUSES, index=STATUSES.index(cur["status"]) if cur.get("status") in STATUSES else 0)
-            applied = s2.date_input("Applied on", value=pd.to_datetime(cur.get("applied_on")).date()
-                                    if cur.get("applied_on") else None)
-            follow = s3.date_input("Follow up on", value=pd.to_datetime(cur.get("follow_up_on")).date()
-                                   if cur.get("follow_up_on") else None)
-            notes = st.text_area("Notes", value=cur.get("notes") or "", height=80)
-            if st.form_submit_button("Save", type="primary"):
-                if status == "applied" and not applied:
-                    applied = date.today()
-                if status == "applied" and not follow:
-                    follow = (applied or date.today()) + timedelta(days=7)  # default reminder a week later
-                backend.save_application(o["id"], status=status, applied_on=applied and applied.isoformat(),
-                                         follow_up_on=follow and follow.isoformat(), notes=notes or None)
-                d["apps"] = backend.applications()
-                st.toast("Saved")
-                st.rerun()
+        mine = apps[apps["offer_id"] == o["id"]]
+        cur = mine.iloc[0].to_dict() if not mine.empty else {}
+        with st.expander("Interview, dates and notes"):
+            with st.form(f"track-{o['id']}", border=False):
+                status = st.selectbox("Status", STATUSES, format_func=STATUS_LABEL.get,
+                                      index=STATUSES.index(cur["status"]) if cur.get("status") in STATUSES else 0)
+                s2, s3 = st.columns(2)
+                applied = s2.date_input("Applied on", value=pd.to_datetime(clean(cur.get("applied_on"))).date()
+                                        if clean(cur.get("applied_on")) else None)
+                follow = s3.date_input("Follow up on", value=pd.to_datetime(clean(cur.get("follow_up_on"))).date()
+                                       if clean(cur.get("follow_up_on")) else None)
+                notes = st.text_area("Notes", value=clean(cur.get("notes")) or "", height=90)
+                if st.form_submit_button("Save", type="primary"):
+                    set_status(backend, d, o["id"], status, applied_on=applied and applied.isoformat(),
+                               follow_up_on=follow and follow.isoformat(), notes=notes or None)
+                    st.toast("Saved")
+                    st.rerun()
 
 
-def page_applications(backend, d):
+def page_applications():
+    backend, d = APP["backend"], APP["data"]
     apps = d["apps"]
     if apps.empty:
-        st.info("No applications tracked yet – pick an offer in **Offers** and set its status.")
+        st.info("No applications tracked yet – use **★ Save** or **✓ Applied** on an offer.")
         return
-    offers = d["offers"][["id", "title", "company", "score", "url"]].rename(columns={"id": "offer_id"})
-    df = apps.merge(offers, on="offer_id", how="left")
-    df["applied_on"] = pd.to_datetime(df["applied_on"], errors="coerce").dt.date
-    df["follow_up_on"] = pd.to_datetime(df["follow_up_on"], errors="coerce").dt.date
-    df["notes"] = df["notes"].fillna("")
-    df[["title", "company"]] = df[["title", "company"]].fillna("(offer no longer in the database)")
-
-    counts = df["status"].value_counts()
-    cols = st.columns(len(STATUSES))
-    for c, s in zip(cols, STATUSES):
-        c.metric(s.capitalize(), int(counts.get(s, 0)))
-
-    follow_ts = pd.to_datetime(df["follow_up_on"], errors="coerce")  # works even when every date is empty
-    due = df[(df["status"].isin(["applied", "interview"])) & (follow_ts <= pd.Timestamp(date.today()))]
-    if not due.empty:
-        st.warning("**Follow-ups due:** " + "; ".join(f"{r.title} ({r.company})" for r in due.itertuples()))
-
-    order = {s: i for i, s in enumerate(["interview", "offer", "applied", "saved", "rejected", "not interested"])}
-    df = df.sort_values(by=["status", "follow_up_on"], key=lambda c: c.map(order) if c.name == "status" else c)
-    edited = st.data_editor(
-        df[["status", "title", "company", "score", "applied_on", "follow_up_on", "notes", "url", "offer_id"]],
-        hide_index=True, width="stretch", disabled=["title", "company", "score", "url", "offer_id"],
-        column_order=["status", "title", "company", "score", "applied_on", "follow_up_on", "notes", "url"],
-        column_config={
-            "status": st.column_config.SelectboxColumn("Status", options=STATUSES, required=True, width="small"),
-            "title": st.column_config.TextColumn("Title", width="large"),
-            "applied_on": st.column_config.DateColumn("Applied"),
-            "follow_up_on": st.column_config.DateColumn("Follow up"),
-            "notes": st.column_config.TextColumn("Notes", width="medium"),
-            "url": st.column_config.LinkColumn("Link", display_text="Open ↗", width="small"),
-            "score": st.column_config.NumberColumn("Score", format="%d", width="small"),
-            "company": st.column_config.TextColumn("Company"),
-        }, key="apps_editor")
-    if st.button("Save changes", type="primary"):
-        before = df.set_index("offer_id")
-        changed = 0
-        for r in edited.itertuples():
-            b = before.loc[r.offer_id]
-            same = lambda x, y: (pd.isna(x) and pd.isna(y)) or x == y
-            if not all(same(x, y) for x, y in ((r.status, b.status), (r.applied_on, b.applied_on),
-                                                (r.follow_up_on, b.follow_up_on), (r.notes, b.notes))):
-                backend.save_application(r.offer_id, status=r.status,
-                                         applied_on=r.applied_on.isoformat() if pd.notna(r.applied_on) and r.applied_on else None,
-                                         follow_up_on=r.follow_up_on.isoformat() if pd.notna(r.follow_up_on) and r.follow_up_on else None,
-                                         notes=r.notes if isinstance(r.notes, str) and r.notes else None)
-                changed += 1
-        d["apps"] = backend.applications()
-        st.toast(f"Saved {changed} change(s)")
-        st.rerun()
+    offers = d["offers"]
+    info = offers.set_index("id") if not offers.empty else pd.DataFrame()
+    follow = pd.to_datetime(apps["follow_up_on"], errors="coerce")
+    columns = [("Saved", ["saved"], "applied"), ("Applied", ["applied"], "interview"),
+               ("Interview", ["interview"], "offer"), ("Offer", ["offer"], None),
+               ("Closed", ["rejected", "not interested"], None)]
+    cols = st.columns(len(columns), gap="small")
+    for col, (name, statuses, nxt) in zip(cols, columns):
+        mask = apps["status"].isin(statuses)
+        part = apps.loc[follow[mask].sort_values(na_position="last").index]  # nearest follow-up first
+        with col:
+            st.markdown(f"<div class='jc-kanban-head'>{name} · {len(part)}</div>", unsafe_allow_html=True)
+            for r in part.itertuples():
+                o = info.loc[r.offer_id] if r.offer_id in info.index else pd.Series(dtype=object)
+                title = clean(o.get("title")) or "(offer not synced yet)"
+                fu = clean(r.follow_up_on)
+                is_due = fu and r.status in ("applied", "interview") and pd.to_datetime(fu).date() <= date.today()
+                with st.container(border=True):
+                    st.markdown(
+                        f"<div class='jc-title' style='font-size:14px'>{html.escape(str(title))}</div>"
+                        f"<div class='jc-meta'>{html.escape(str(clean(o.get('company')) or ''))}"
+                        + (f" · {int(o['score'])}" if clean(o.get('score')) is not None else "") + "</div>"
+                        + (f"<div class='jc-meta'>Applied {clean(r.applied_on)}</div>" if clean(r.applied_on) else "")
+                        + (f"<div class='jc-meta'>Follow up <span class='{'jc-due' if is_due else ''}'>{fu}</span></div>" if fu else "")
+                        + (f"<div class='jc-meta'>{STATUS_LABEL.get(r.status)}</div>" if name == "Closed" else ""),
+                        unsafe_allow_html=True)
+                    if nxt and st.button(f"→ {STATUS_LABEL[nxt]}", key=f"nx-{r.offer_id}", width="stretch"):
+                        set_status(backend, d, r.offer_id, nxt)
+                        st.rerun()
+                    with st.popover("Edit", width="stretch"):
+                        with st.form(f"kb-{r.offer_id}", border=False):
+                            stt = st.selectbox("Status", STATUSES, index=STATUSES.index(r.status) if r.status in STATUSES else 0, format_func=STATUS_LABEL.get)
+                            ap = st.date_input("Applied on", value=pd.to_datetime(clean(r.applied_on)).date() if clean(r.applied_on) else None)
+                            fo = st.date_input("Follow up on", value=pd.to_datetime(fu).date() if fu else None)
+                            nt = st.text_area("Notes", value=clean(r.notes) or "")
+                            if st.form_submit_button("Save", type="primary"):
+                                set_status(backend, d, r.offer_id, stt, applied_on=ap and ap.isoformat(),
+                                           follow_up_on=fo and fo.isoformat(), notes=nt or None)
+                                st.rerun()
+                        if clean(o.get("url")):
+                            st.link_button("Open offer ↗", o["url"], width="stretch")
 
 
-def page_scanner(backend, d):
+def page_scanner():
+    backend, d = APP["backend"], APP["data"]
     runs, queue, skipped = d["runs"], d["queue"], d["skipped"]
     last = runs.iloc[0] if not runs.empty else None
     m1, m2, m3, m4 = st.columns(4)
@@ -318,12 +474,9 @@ def page_scanner(backend, d):
     m4.metric("Waiting in queue", len(queue))
 
     with st.container(border=True):
-        st.markdown("**Run the scanner**")
-        b1, b2 = st.columns(2)
-        if b1.button("🔄 Scan now", type="primary", width="stretch"):
-            ok, msg = dispatch_scan({"hours": "24"})
-            (st.success if ok else st.error)(msg)
-        if b2.button("📊 Send weekly report now", width="stretch"):
+        st.markdown("**Weekly report**")
+        st.caption("Scans start from **🔄 Scan now** in the side panel.")
+        if st.button("📊 Send weekly report now", width="stretch"):
             ok, msg = dispatch_scan({"report_only": "true"})
             (st.success if ok else st.error)(msg.replace("Scan started", "Report requested").split(" – ")[0])
 
@@ -351,7 +504,7 @@ def page_scanner(backend, d):
         t = runs.head(14).copy()
         t["when"] = t["started_at"].dt.tz_convert("Europe/Warsaw")
         t["minutes"] = ((t["finished_at"] - t["started_at"]).dt.total_seconds() / 60).round()
-        st.dataframe(t[["when", "minutes", "new_offers", "triaged_out", "scored", "notified", "queued", "gemini_errors"]],
+        st.dataframe(t[["when", "new_offers", "scored", "notified", "queued", "gemini_errors", "triaged_out", "minutes"]],
                      hide_index=True, width="stretch",
                      column_config={"when": st.column_config.DatetimeColumn("Started", format="D MMM, HH:mm"),
                                     "new_offers": "New", "triaged_out": "AI skipped", "scored": "Scored",
@@ -371,7 +524,7 @@ def page_scanner(backend, d):
             sk = sk[sk["reason"].isin(why)]
         if q:
             sk = sk[(sk["title"].fillna("") + " " + sk["company"].fillna("")).str.contains(q, case=False, regex=False)]
-        st.dataframe(sk[["reason", "title", "company", "portal", "url"]].head(300), hide_index=True,
+        st.dataframe(sk[["title", "company", "url", "reason", "portal"]].head(300), hide_index=True,
                      width="stretch",
                      column_config={"url": st.column_config.LinkColumn("Link", display_text="Open ↗")})
     if not queue.empty:
@@ -380,7 +533,8 @@ def page_scanner(backend, d):
                          column_config={"url": st.column_config.LinkColumn("Link", display_text="Open ↗")})
 
 
-def page_market(d):
+def page_market():
+    d = APP["data"]
     offers = d["offers"]
     if offers.empty:
         st.info("No data yet.")
@@ -436,23 +590,62 @@ def page_market(d):
 
 
 # ---------------------------------------------------------------- main
-backend = get_backend()
-with st.sidebar:
+st.markdown(CSS, unsafe_allow_html=True)
+APP = {"backend": get_backend()}
+refresh = st.session_state.pop("refresh", False)
+APP["data"] = load(APP["backend"], force=refresh)
+
+
+def sidebar_status(d: dict) -> None:
+    """Always-visible scanner status + actions (desktop; on a phone it sits behind the ≫ icon)."""
     st.markdown("### 🔎 AI Job Scanner")
-    refresh = st.button("↻ Refresh data", width="stretch")
-d = load(backend, force=refresh)
-with st.sidebar:
+    runs, apps = d["runs"], d["apps"]
+    last = runs.iloc[0] if not runs.empty else None
+    if last is not None and pd.notna(last["finished_at"]):
+        hours = (pd.Timestamp.now(tz="UTC") - last["finished_at"]).total_seconds() / 3600
+        errors = int(clean(last.get("gemini_errors")) or 0)
+        when = last["finished_at"].tz_convert("Europe/Warsaw").strftime("%d %b, %H:%M")
+        ago = f"{hours:.0f} h ago" if hours >= 1 else "just now"
+        if hours >= 26:
+            st.warning(f"No scan for {ago.removesuffix(' ago')} (last {when})", icon=":material/warning:")
+        elif errors:
+            st.warning(f"Last scan {ago} · {errors} Gemini errors", icon=":material/warning:")
+        else:
+            st.success(f"Last scan {ago} · {when}", icon=":material/check_circle:")
+        st.caption(f"Scored {int(clean(last.get('scored')) or 0)} · e-mailed {int(clean(last.get('notified')) or 0)}")
+    else:
+        st.info("No scans yet")
+    follow = pd.to_datetime(apps["follow_up_on"], errors="coerce") if not apps.empty else pd.Series(dtype="datetime64[ns]")
+    due = int(((apps["status"].isin(["applied", "interview"])) & (follow <= pd.Timestamp(date.today()))).sum()) \
+        if not apps.empty else 0
+    c1, c2 = st.columns(2)
+    c1.metric("In queue", len(d["queue"]))
+    c2.metric("Follow-ups due", due)
+    if st.button("🔄 Scan now", type="primary", width="stretch", key="side-scan"):
+        ok, msg = dispatch_scan({"hours": "24"})
+        (st.success if ok else st.error)(msg)
+    if st.button("↻ Refresh data", width="stretch", key="side-refresh"):
+        st.session_state.refresh = True
+        st.rerun()
     st.caption(f"Data loaded {d['loaded'].astimezone().strftime('%H:%M')} · {len(d['offers'])} offers")
-    if os.getenv("APP_BACKEND") != "local" and st.button("Log out", width="stretch"):
+    if os.getenv("APP_BACKEND") != "local" and st.button("Log out", width="stretch", key="side-logout"):
         st.session_state.clear()
         st.rerun()
 
-t1, t2, t3, t4 = st.tabs(["Offers", "My applications", "Scanner", "Market"])
-with t1:
-    page_offers(backend, d)
-with t2:
-    page_applications(backend, d)
-with t3:
-    page_scanner(backend, d)
-with t4:
-    page_market(d)
+
+with st.sidebar:
+    sidebar_status(APP["data"])
+
+PAGES = {
+    "home": st.Page(page_home, title="Home", icon=":material/home:", url_path="home",
+                    default=os.getenv("APP_START_PAGE", "home") == "home"),
+    "offers": st.Page(page_offers, title="Offers", icon=":material/work:", url_path="offers",
+                      default=os.getenv("APP_START_PAGE") == "offers"),
+    "applications": st.Page(page_applications, title="Applications", icon=":material/view_kanban:",
+                            url_path="applications", default=os.getenv("APP_START_PAGE") == "applications"),
+    "scanner": st.Page(page_scanner, title="Scanner", icon=":material/radar:", url_path="scanner",
+                       default=os.getenv("APP_START_PAGE") == "scanner"),
+    "market": st.Page(page_market, title="Market", icon=":material/bar_chart:", url_path="market",
+                      default=os.getenv("APP_START_PAGE") == "market"),
+}
+st.navigation(list(PAGES.values()), position="top").run()

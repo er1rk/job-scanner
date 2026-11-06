@@ -7,7 +7,7 @@ A small automation that finds fresh job offers and scores them against my profil
 - **Two-stage LLM workflow** – a cheap batch pre-filter on titles, then detailed scoring with a fixed rubric and a JSON schema (15 extracted fields, salary normalised to PLN/month)
 - **A dataset, not just alerts** – every scored offer is stored; a weekly report shows the skills that block near-miss offers, the most required tools and salary medians
 - **Runs unattended** – backup schedules, a queue, a time budget, model fallback with a circuit breaker, monitoring of tokens and stage times, 52 automated tests
-- **Web app** (Streamlit + Supabase) – browse and filter offers, track applications with follow-up reminders, start a scan, edit search settings, market charts; login + Row Level Security
+- **Web app** (Streamlit + Supabase) – morning summary, offers as cards with one-tap status, a kanban application tracker with follow-up reminders, start a scan, edit search settings, market charts; login + Row Level Security
 - **Public repo, private data** – profile, keys and search settings in GitHub Secrets; the database is encrypted
 
 ## Architecture
@@ -68,12 +68,17 @@ Gap names are merged case-insensitively. On report days the CSV is attached to t
 ## Web app
 `app/streamlit_app.py` – a Streamlit app on top of Supabase (Postgres + auth):
 
-| Tab | What it does |
+| Page | What it does |
 |---|---|
-| **Offers** | every scored offer with search and filters (period, score, portal, category, work mode); pick one to see the reason, strengths, gaps and to set its status |
-| **My applications** | tracker: saved → applied → interview → offer / rejected, applied and follow-up dates (a reminder a week after applying), notes; follow-ups due are flagged |
-| **Scanner** | last scans, queue, skipped offers with the reason, **Scan now** / **Send weekly report now** (GitHub API), and the search settings – keywords, locations, title filters, threshold – which the scanner reads at the start of every run |
+| **Home** | the morning summary: new offers and new matches from the last 24 h, follow-ups due (one tap: *followed up* / *rejected*), scanner health, and the best new matches with quick actions |
+| **Offers** | offers as cards in the style of the e-mail digest (score ring, salary, work mode, contract, English), search and filters; the selected offer opens beside the list (above it on a phone) with the reason, strengths and gaps and one-tap **Save / Applied / Not interested** – *Applied* sets today's date and a follow-up reminder a week later |
+| **Applications** | kanban board: Saved → Applied → Interview → Offer, plus Closed; move a card to the next stage in one tap, edit dates and notes in a pop-over; due follow-ups in red |
+| **Scanner** | last scans, queue, skipped offers with the reason, **Send weekly report now** (GitHub API), and the search settings – keywords, locations, title filters, threshold – which the scanner reads at the start of every run |
 | **Market** | what blocks near-miss offers, most required tools, offers per day by portal, salary ranges by category |
+
+A **side panel** on every page shows the scanner's status (last scan, Gemini errors, a warning if no scan for a day), the queue and follow-ups due, with **Scan now** (GitHub API) and *Refresh data*.
+
+Works on a phone: columns stack, the summary turns into a 2 × 2 grid and the offer details move above the list.
 
 The scanner keeps its own SQLite database and syncs to Supabase after each run (one-way for scan data); the app owns `applications` and `settings`, so the two never overwrite each other. Row Level Security lets only the logged-in user read anything; sign-ups are disabled. Local development without Supabase: `python app/demo_data.py data/demo.db && APP_BACKEND=local LOCAL_DB=data/demo.db streamlit run app/streamlit_app.py`.
 
