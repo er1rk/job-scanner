@@ -916,3 +916,81 @@ class ExternalTriggerTests(unittest.TestCase):
             self.run_main(tmp, [], {})
             send = self.run_main(tmp, [], {"HOURS": "auto", "BACKUP_RUN": "true"})
             send.assert_not_called()
+
+
+class TitleFilterTests(unittest.TestCase):
+    def test_whole_words_and_stems(self):
+        ex = ["intern", "lead", "praktyk*", "stażyst*", "head of"]
+        self.assertFalse(scanner._excluded("Internal Audit Analyst", ex))
+        self.assertFalse(scanner._excluded("International Payments Specialist", ex))
+        self.assertTrue(scanner._excluded("Data Intern", ex))
+        self.assertTrue(scanner._excluded("Team Lead – KYC", ex))
+        self.assertFalse(scanner._excluded("Team Leader", ex))               # needs "leader" in the list
+        self.assertTrue(scanner._excluded("Praktykant w dziale AML", ex))
+        self.assertTrue(scanner._excluded("Stażysta (K/M)", ex))
+        self.assertTrue(scanner._excluded("Head of Risk", ex))
+        self.assertFalse(scanner._excluded("Młodszy Specjalista ds. KYC", ex))
+
+
+class FreshFirstAndFindTests(unittest.TestCase):
+    run_main = EndToEndTests.run_main
+
+    def cards(self, ids):
+        return "".join(f'''<div class="base-card" data-entity-urn="urn:li:jobPosting:{i}">
+            <h3 class="base-search-card__title">Analyst {i}</h3><h4 class="base-search-card__subtitle">Co{i}</h4>
+            <span class="job-search-card__location">L</span></div>''' for i in ids)
+
+    def test_fresh_offers_go_before_the_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, [], {}, search_html=self.cards([1, 2, 3]), max_offers_per_run=1)  # 2, 3 queued
+            send = self.run_main(tmp, [], {}, search_html=self.cards([9]), max_offers_per_run=1)
+            self.assertEqual([r["id"] for r in send.call_args.args[0]], ["9"])                 # today's first
+            st = Store(Path(tmp) / "jobs.db")
+            self.assertEqual([o["id"] for o in st.queued()], ["2", "3"])
+            st.close()
+
+    def test_find_offer_by_link_words_and_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Store(Path(tmp) / "jobs.db")
+            st.save_offer({"id": "pracuj:1005204970", "source": "pracuj", "title": "Młodszy Specjalista ds. KYC",
+                           "company": "Bank X", "location": "Łódź",
+                           "url": "https://www.pracuj.pl/praca/mlodszy-specjalista-kyc-lodz,oferta,1005204970",
+                           **{**GEMINI_RESULT, "score": 55}})
+            st.save_triaged([{"id": "t1", "title": "Java Developer", "company": "Soft", "url": "u1"}])
+            st.save_skipped([{"id": "t2", "title": "Senior KYC Analyst", "company": "Y", "url": "u2"}], "title")
+            st.enqueue([{"id": "q1", "title": "Fraud Analyst", "company": "Z", "url": "u3"}])
+            by_link = st.find("https://www.pracuj.pl/praca/mlodszy-specjalista-mlodsza-specjalistka-ds-weryfikacji-"
+                              "klientow-kyc-lodz,oferta,1005204970")
+            self.assertEqual([o["id"] for o in by_link["scored"]], ["pracuj:1005204970"])
+            self.assertEqual([o["id"] for o in st.find("mlodszy kyc")["scored"]], ["pracuj:1005204970"])  # accents
+            self.assertEqual(st.find("senior kyc")["skipped"][0]["reason"], "title")
+            self.assertEqual([o["id"] for o in st.find("fraud")["queued"]], ["q1"])
+            self.assertNotIn("t2", st.seen_ids())                                 # title-filtered stays reconsiderable
+            body = scanner.build_find_email("kyc", st.find("kyc"), 60)
+            self.assertIn("Scored 55/100", body)
+            self.assertIn("below the e-mail threshold", body)
+            self.assertIn("dropped by the title filter", body)
+            self.assertIn("Not in the database", scanner.build_find_email("nothing", st.find("zzz"), 60))
+            self.assertEqual(st.triaged_since("2000")[0]["id"], "t1")            # report lists AI drops only
+            st.close()
+
+    def test_find_mode_emails_and_skips_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_main(tmp, [], {})
+            with mock.patch.object(scanner, "send_html") as sent:
+                send = self.run_main(tmp, [], {"FIND": "Data Analyst"})
+            send.assert_not_called()
+            self.assertIn("Find offer: 2 match", sent.call_args.args[0])  # scored + "Senior" dropped by title
+            st = Store(Path(tmp) / "jobs.db")
+            self.assertEqual(st.con.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)  # no scan
+            st.close()
+
+    def test_weekly_report_attaches_ai_skips(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(scanner, "send_html") as sent:
+            st = Store(Path(tmp) / "jobs.db")
+            st.save_triaged([{"id": "t1", "title": "Java Developer", "company": "Soft", "url": "u1"}])
+            scanner.send_weekly_report(st, {"min_score_to_notify": 60}, None, None, None)
+            st.close()
+        name, text = sent.call_args.args[3][0]
+        self.assertTrue(name.startswith("skipped_by_ai_"))
+        self.assertIn("Java Developer", text)

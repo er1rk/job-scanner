@@ -44,7 +44,8 @@ flowchart LR
 9. **Time budget:** after `time_budget_minutes` (40) the scanner stops scoring and queues the rest, so a slow day never runs into the 60-minute job timeout (a timed-out job would save nothing).
 10. **Gemini resilience:** models from `gemini_models` are tried in order – an overloaded model (503) hands the call to the next one, a model that hits its daily free-tier quota or was retired is skipped for the rest of the run, per-minute limits wait at most 60 s, and only *lite* models are used as automatic fallbacks. If Gemini fails several offers in a row the run stops scoring, keeps everything in the queue and says so in the e-mail. Every Gemini error is logged with Google's status.
 11. **Monitoring:** every run records Gemini calls, failed calls, input/output tokens, time per stage (search, pre-filter, scoring) and per-portal results including description-fetch errors.
-12. If the portals return 0 offers across all searches, the e-mail carries a warning – that usually means the page layout changed or the request was blocked, not that there are no jobs.
+12. **Find offer:** run the workflow with a link (or words from the title/company) in *Find offer* and an e-mail tells you where that offer ended up – scored (score, gaps, e-mailed or not), skipped by the title filter / AI pre-filter / as a duplicate, waiting in the queue, or never returned by a search. Fresh offers are scored before the queue.
+13. If the portals return 0 offers across all searches, the e-mail carries a warning – that usually means the page layout changed or the request was blocked, not that there are no jobs.
 
 ## Weekly market & skill-gap report
 All numbers are computed in Python straight from the database; the LLM only receives the aggregates and turns them into at most three learning recommendations, so it cannot invent counts.
