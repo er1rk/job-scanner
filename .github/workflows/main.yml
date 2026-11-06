@@ -36,6 +36,9 @@ on:
         description: "Only send the weekly report (no scan)"
         type: boolean
         default: false
+      find:
+        description: "Find offer: paste a link or words from the title/company - the answer comes by e-mail (no scan)"
+        default: ""
 
 # Never run two scans at once: both would restore the same database and the later save would overwrite
 # the earlier one. A second run waits for the first.
@@ -89,6 +92,7 @@ jobs:
           IGNORE_SEEN: ${{ inputs.ignore_seen }}
           ATTACH_CSV: ${{ inputs.attach_csv }}
           SEND_REPORT: ${{ inputs.send_report }}
+          FIND: ${{ inputs.find }}
           # Every scheduled or external run skips itself if today's scan / report already happened, so the
           # external trigger and GitHub's own (unreliable) schedule never send the same e-mail twice.
           BACKUP_RUN: ${{ github.event_name == 'schedule' || inputs.auto }}

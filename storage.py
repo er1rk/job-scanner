@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import sqlite3
 import zlib
 from datetime import datetime, timezone
@@ -83,7 +84,7 @@ CREATE TABLE IF NOT EXISTS queue (               -- offers found but not scored 
     queued_at TEXT NOT NULL,
     attempts  INTEGER NOT NULL DEFAULT 0         -- failed scoring attempts
 );
-CREATE TABLE IF NOT EXISTS triaged (             -- dropped by the AI pre-filter (title-only), kept for review
+CREATE TABLE IF NOT EXISTS triaged (             -- offers skipped before scoring, kept for review (reason column)
     id         TEXT PRIMARY KEY,
     source     TEXT,
     title      TEXT,
@@ -134,6 +135,7 @@ class Store:
                                      "score_seconds": "INTEGER", "gemini_calls": "INTEGER",
                                      "gemini_errors": "INTEGER", "tokens_in": "INTEGER", "tokens_out": "INTEGER",
                                      "window_hours": "INTEGER"},
+                            "triaged": {"reason": "TEXT"},
                             "offers": {"fingerprint": "TEXT"}}.items():
             have = {r[1] for r in self.con.execute(f"PRAGMA table_info({table})")}
             for col, typ in cols.items():
@@ -217,9 +219,56 @@ class Store:
         self.con.executemany("INSERT OR IGNORE INTO seen(id) VALUES (?)", [(o["id"],) for o in offers])
         self.con.commit()
 
+    def save_skipped(self, offers: list[dict], reason: str) -> None:
+        """Offers dropped by the title filter or as cross-portal duplicates - stored only so "Find offer" can
+        explain them. NOT marked as seen: after a config change they are considered again."""
+        self.con.executemany(
+            "INSERT OR IGNORE INTO triaged(id, source, title, company, location, url, triaged_at, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(o["id"], o.get("source"), o.get("title"), o.get("company"), o.get("location"), o.get("url"), now_iso(),
+              reason) for o in offers])
+        self.con.commit()
+
     def triaged_since(self, since_iso: str) -> list[dict]:
+        """Offers the AI pre-filter dropped (not the title-filter / duplicate records)."""
         return [dict(r) for r in self.con.execute(
-            "SELECT * FROM triaged WHERE triaged_at >= ? ORDER BY triaged_at", (since_iso,))]
+            "SELECT * FROM triaged WHERE triaged_at >= ? AND (reason IS NULL OR reason = 'ai') ORDER BY triaged_at",
+            (since_iso,))]
+
+    def triaged_csv(self, since_iso: str) -> str:
+        buf = io.StringIO()
+        buf.write("\ufeff")
+        w = csv.writer(buf)
+        w.writerow(["triaged_at", "source", "title", "company", "location", "url"])
+        for t in self.triaged_since(since_iso):
+            w.writerow([t["triaged_at"], t["source"], t["title"], t["company"], t["location"], t["url"]])
+        return buf.getvalue()
+
+    def find(self, query: str) -> dict:
+        """Where did an offer end up? query = a link from any portal, or words from its title / company."""
+        from sources.common import normalise
+        q = query.strip()
+        ids = set(re.findall(r"oferta,(\d+)", q)) | set(re.findall(r"/jobs/view/(?:[^/]*?-)?(\d+)", q)) | \
+            set(re.findall(r"currentJobId=(\d+)", q))
+        slug = re.findall(r"/(?:job-offer|oferta-pracy|job)/([a-z0-9-]+)", q)
+        words = normalise(q).split() if not (ids or slug) else []
+
+        def hit(url, title, company):
+            u = url or ""
+            if ids and any(i in u for i in ids):
+                return True
+            if slug and any(sl in u for sl in slug):
+                return True
+            text = normalise(f"{title} {company}")
+            return bool(words) and all(w in text for w in words)
+
+        scored = [dict(r) for r in self.con.execute(
+            "SELECT id, source, title, company, location, url, score, verdict, gaps, one_line_reason, first_seen, "
+            "notified FROM offers") if hit(r["url"], r["title"], r["company"])]
+        skipped = [dict(r) for r in self.con.execute("SELECT * FROM triaged")
+                   if hit(r["url"], r["title"], r["company"])]
+        queued = [o for o in self.queued() if hit(o.get("url"), o.get("title"), o.get("company"))]
+        return {"scored": scored, "skipped": skipped, "queued": queued}
 
     def queue_size(self) -> int:
         return self.con.execute("SELECT COUNT(*) FROM queue").fetchone()[0]

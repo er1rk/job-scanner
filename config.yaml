@@ -27,10 +27,12 @@ pages_per_search: 1
 # accent-insensitive). Useful for portals that match keywords loosely (e.g. pracuj.pl).
 include_title_keywords: []
 
-# Skip offers whose title contains any of these words (case-insensitive) before calling the AI
+# Skip offers whose title contains any of these WHOLE words ("intern" doesn't hit "Internal").
+# End a word with * to match a stem: "praktyk*" hits "praktykant", "praktyki".
 exclude_title_keywords:
   - senior
   - lead
+  - leader
   - head of
   - director
   - manager
@@ -38,10 +40,10 @@ exclude_title_keywords:
   - intern
   - internship
   - trainee
-  - student
+  - student*
   - staż
-  - stażyst
-  - praktyk
+  - stażyst*
+  - praktyk*
 
 # AI pre-filter: before the detailed scoring, Gemini sees only titles (batches of triage_batch_size per call)
 # and drops clear mismatches. Keeps everything if a call fails. Set to false to switch off.

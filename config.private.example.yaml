@@ -11,7 +11,7 @@ locations:
 include_title_keywords:      # optional: keep only titles containing one of these
   - analyst
 
-exclude_title_keywords:
+exclude_title_keywords:      # whole words; end with * for a stem (praktyk*)
   - senior
   - intern
 

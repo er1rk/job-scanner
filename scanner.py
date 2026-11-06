@@ -24,7 +24,7 @@ import smtplib
 import sys
 import time
 import math
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -84,9 +84,21 @@ def build_searches(cfg: dict) -> list[dict]:
     return searches
 
 
+def _excluded(title: str, words: list[str]) -> bool:
+    """Whole-word match, so "intern" doesn't drop "Internal Audit"; a trailing * matches a stem ("praktyk*")."""
+    t = common.strip_accents(title.lower())
+    for w in words:
+        w = common.strip_accents(w.lower().strip())
+        stem = w.endswith("*")
+        pat = r"(?<![a-z0-9])" + re.escape(w.rstrip("*")) + ("" if stem else r"(?![a-z0-9])")
+        if re.search(pat, t):
+            return True
+    return False
+
+
 def _title_ok(title: str, cfg: dict) -> bool:
     t = common.strip_accents(title.lower())
-    if any(common.strip_accents(w.lower()) in t for w in cfg.get("exclude_title_keywords") or []):
+    if _excluded(title, cfg.get("exclude_title_keywords") or []):
         return False
     include = cfg.get("include_title_keywords") or []
     return not include or any(common.strip_accents(w.lower()) in t for w in include)
@@ -106,6 +118,7 @@ def fetch_offers(cfg: dict, seen: set, seen_fps: set, stats: dict) -> list[dict]
     searches = build_searches(cfg)
     run_fps: set[str] = set()
     groups, per_source, failed_sources = [], {}, []
+    skipped: dict[str, list[dict]] = {"title": [], "duplicate": []}
     for name in cfg.get("sources") or ["linkedin"]:
         mod = sources.ALL.get(name)
         if not mod:
@@ -127,9 +140,11 @@ def fetch_offers(cfg: dict, seen: set, seen_fps: set, stats: dict) -> list[dict]
             ids.add(o["id"])
             if not _title_ok(o.get("title", ""), cfg):
                 st["filtered"] += 1
+                skipped["title"].append(o)
                 continue
             if o["fingerprint"] in seen_fps or o["fingerprint"] in run_fps:
                 st["duplicates"] += 1  # same company + title already found on another portal
+                skipped["duplicate"].append(o)
                 continue
             run_fps.add(o["fingerprint"])
             new.append(o)
@@ -141,7 +156,7 @@ def fetch_offers(cfg: dict, seen: set, seen_fps: set, stats: dict) -> list[dict]
     stats.update(searches=len(searches), cards_found=sum(v["cards"] for v in per_source.values()),
                  filtered_title=sum(v["filtered"] for v in per_source.values()),
                  new_offers=sum(v["new"] for v in per_source.values()),
-                 sources=json.dumps(per_source), failed_sources=failed_sources)
+                 sources=json.dumps(per_source), failed_sources=failed_sources, _skipped=skipped)
     print(f"Searches: {len(searches)} per source, unique new offers: {stats['new_offers']}")
     return round_robin(groups)  # the per-run cap is applied in main(), the rest goes to the queue
 
@@ -518,7 +533,8 @@ def build_email(results: list[dict], csv_text: str | None = None, warning: str =
         + "</table></td></tr></table></body></html>")
 
 
-def send_html(subject: str, body_html: str, csv_text: str | None = None) -> None:
+def send_html(subject: str, body_html: str, csv_text: str | None = None,
+              extra: list[tuple[str, str]] | None = None) -> None:
     sender, password = os.getenv("EMAIL_ADDRESS"), os.getenv("EMAIL_APP_PASSWORD")
     if not (sender and password):
         print("E-mail not configured - skipping notification")
@@ -531,10 +547,52 @@ def send_html(subject: str, body_html: str, csv_text: str | None = None) -> None
     if csv_text:
         msg.add_attachment(csv_text.encode("utf-8"), maintype="text", subtype="csv",
                            filename=f"jobs_{date.today():%Y-%m-%d}.csv")
+    for name, text in extra or []:
+        msg.add_attachment(text.encode("utf-8"), maintype="text", subtype="csv", filename=name)
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(sender, password)
         smtp.send_message(msg)
     print(f"E-mail sent: {subject.split(':')[0]}")
+
+
+def build_find_email(query: str, found: dict, threshold: int) -> str:
+    """Where did an offer end up - scored, skipped (and why), queued or never found."""
+    INK, INK2, MUTED, LINE = report.INK, report.INK2, report.MUTED, report.LINE
+    reasons = {"ai": "dropped by the AI pre-filter (title only)", None: "dropped by the AI pre-filter (title only)",
+               "title": "dropped by the title filter (include/exclude words in config)",
+               "duplicate": "skipped as a duplicate of the same job on another portal"}
+    rows = []
+    for o in found["scored"]:
+        gaps = ", ".join(json.loads(o["gaps"]) if o.get("gaps") else [])
+        sent = "sent in the digest" if o.get("notified") else (
+            "below the e-mail threshold" if (o.get("score") or 0) < threshold else "scored, not e-mailed")
+        rows.append((o, f"<b>Scored {o.get('score')}/100</b> · {sent}<br>{html.escape(o.get('one_line_reason') or '')}"
+                        + (f"<br><span style='color:#b42318'>Gaps: {html.escape(gaps)}</span>" if gaps else "")))
+    for o in found["skipped"]:
+        rows.append((o, f"<b>Not scored</b> – {reasons.get(o.get('reason'), o.get('reason'))} on {o['triaged_at'][:10]}"))
+    for o in found["queued"]:
+        rows.append((o, "<b>Waiting in the queue</b> – will be scored on the next run"))
+    if rows:
+        cards = "".join(
+            f"<tr><td style='padding:0 0 10px'><div style='background:#fff;border:1px solid {LINE};border-radius:10px;"
+            f"padding:14px 16px'><a href='{html.escape(o.get('url') or '')}' style='font-size:15px;font-weight:600;"
+            f"color:{INK};text-decoration:none'>{html.escape(o.get('title') or '')}</a><div style='font-size:13px;"
+            f"color:{INK2};margin:2px 0 8px'>{html.escape(o.get('company') or '')} · {html.escape(o.get('location') or '')}"
+            f" · {html.escape(sources.label(o.get('source')))}</div><div style='font-size:13px;line-height:19px;"
+            f"color:{INK}'>{status}</div></div></td></tr>" for o, status in rows)
+    else:
+        cards = (f"<tr><td><div style='background:#fff;border:1px solid {LINE};border-radius:10px;padding:14px 16px;"
+                 f"font-size:13px;line-height:19px;color:{INK}'>Not in the database. No search returned it: the "
+                 f"portal didn't match it to your keywords / locations within the time window, or it was "
+                 f"published after the last scan.</div></td></tr>")
+    return (f"<!doctype html><html><body style='margin:0;background:{report.PAGE}'><table role='presentation' "
+            f"width='100%' cellpadding='0' cellspacing='0'><tr><td align='center' style='padding:24px 12px'>"
+            f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='max-width:640px;"
+            f"font-family:{report.FONT}'><tr><td style='padding:0 2px 14px'><div style='font-size:12px;"
+            f"letter-spacing:.04em;text-transform:uppercase;color:{MUTED}'>Job scanner · find offer</div>"
+            f"<div style='font-size:20px;font-weight:600;color:{INK};margin-top:2px'>{len(rows)} match(es)</div>"
+            f"<div style='font-size:13px;color:{INK2};word-break:break-all'>{html.escape(query)}</div></td></tr>"
+            f"{cards}</table></td></tr></table></body></html>")
 
 
 def send_email(results: list[dict], csv_text: str | None = None, warning: str = "", waiting: int = 0,
@@ -555,8 +613,10 @@ def send_weekly_report(store: Store, cfg: dict, profile: str | None, api_key: st
         recs = report.ai_recommendations(
             stats, profile, lambda prompt, schema: call_gemini(prompt, schema, cfg, api_key, temperature=0.4))
     body = report.build_report_html(stats, recs, csv_attached=bool(csv_text))
+    since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    extra = [(f"skipped_by_ai_{date.today():%Y-%m-%d}.csv", store.triaged_csv(since))] if stats.get("triaged_out") else []
     send_html(f"Weekly job market report {date.today():%d.%m}: {stats['offers']} offers, "
-              f"{stats['near_miss_offers']} near misses", body, csv_text)
+              f"{stats['near_miss_offers']} near misses", body, csv_text, extra)
     return {"stats": stats, "recs": recs, "html": body}
 
 
@@ -632,6 +692,13 @@ def main() -> None:
         migrated = store.import_legacy_seen(SEEN_FILE)
         if migrated:
             print(f"Migrated {migrated} ids from seen.json into the database")
+    if os.getenv("FIND", "").strip():  # "Find offer": e-mail where an offer ended up, no scanning
+        found = store.find(os.environ["FIND"])
+        send_html(f"Find offer: {sum(len(v) for v in found.values())} match(es)",
+                  build_find_email(os.environ["FIND"], found, cfg["min_score_to_notify"]))
+        print(f"Find offer: {sum(len(v) for v in found.values())} match(es) e-mailed")  # count only - logs are public
+        close_db(store)
+        return
     backup = os.getenv("BACKUP_RUN", "").lower() == "true"
     if os.getenv("REPORT_ONLY", "").lower() == "true":  # Sunday: weekly report from the database, no scanning
         if backup and store.report_sent_today():
@@ -666,12 +733,15 @@ def main() -> None:
     t_search = time.monotonic()
     backlog_ids = {o["id"] for o in backlog}
     new = [o for o in new if o["id"] not in backlog_ids]
+    for reason, items in stats.pop("_skipped", {}).items():
+        store.save_skipped(items, reason)  # only so "Find offer" can explain them
     new, triaged_out = triage_offers(new, profile, cfg, api_key)
     t_triage = time.monotonic()
     store.save_triaged(triaged_out)  # kept for review; marked as seen so they are not triaged again
     if cfg.get("triage", True):
         print(f"AI pre-filter: kept {len(new)}, dropped {len(triaged_out)}")
-    candidates = backlog + new
+    # fresh offers first - they matter most for applying early; the queue gets what is left of the cap
+    candidates = new + backlog
     cap = int(cfg["max_offers_per_run"])
     offers, overflow = candidates[:cap], candidates[cap:]
     store.enqueue(overflow)  # nothing over the cap is lost - it is scored on the next run
