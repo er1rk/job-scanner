@@ -71,8 +71,10 @@ def get_backend():
 def load_feedback(backend):
     """None = the feedback table doesn't exist yet (supabase/schema.sql not re-run) - the app still works."""
     try:
+        st.session_state.pop("feedback_error", None)
         return backend.feedback()
-    except Exception:
+    except Exception as e:
+        st.session_state.feedback_error = f"{type(e).__name__}: {str(e)[:200]}"
         return None
 
 
@@ -527,6 +529,8 @@ def page_scanner():
 
     st.markdown("#### Skipped offers (last 30 days)")
     fb = d.get("feedback")
+    if fb is None:  # not loaded or the table was missing at login - check again instead of waiting for a refresh
+        fb = d["feedback"] = load_feedback(backend)
     if skipped.empty:
         st.caption("Nothing skipped yet.")
     else:
@@ -554,6 +558,8 @@ def page_scanner():
         b1, b2 = st.columns(2)
         if fb is None:
             st.info("To mark offers, run the updated `supabase/schema.sql` once in Supabase (SQL Editor).")
+            if st.session_state.get("feedback_error"):
+                st.caption(f"Supabase said: {st.session_state.feedback_error}")
         else:
             if b1.button(f"★ Interested ({len(picked)})", type="primary", width="stretch", disabled=picked.empty):
                 rows = [r for r in picked.to_dict("records") if r["reason"] != "duplicate"]
