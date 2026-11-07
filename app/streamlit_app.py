@@ -179,6 +179,12 @@ CSS = """
 .jc-kanban-head {font-size: 13px; font-weight: 600; color: #52514e; text-transform: uppercase; letter-spacing: .03em;}
 .jc-due {color: #b42318; font-weight: 600;}
 div[class*="st-key-sel-"] {border-color: #2a78d6 !important; box-shadow: 0 0 0 1px #2a78d6;}
+/* desktop: the offer details stay on screen while the list scrolls under them */
+@media (min-width: 641px) {
+  .st-key-offers-layout > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] {align-items: flex-start;}
+  .st-key-offers-layout > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:last-child {
+    position: sticky; top: 4.2rem; max-height: calc(100vh - 5rem); overflow-y: auto; z-index: 1;}
+}
 @media (max-width: 640px) {
   .block-container {padding-left: 1rem; padding-right: 1rem; padding-top: 3.6rem;}
   /* phone: show the selected offer's details ABOVE the list */
