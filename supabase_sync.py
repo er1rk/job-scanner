@@ -120,3 +120,10 @@ def load_settings(url: str, key: str) -> dict:
         elif want is int and isinstance(v, (int, float)) and 0 <= v <= 100:
             out[k] = int(v)
     return out
+
+
+def load_feedback(url: str, key: str, limit: int = 200) -> list[dict]:
+    """Skipped offers marked "interested" in the web app, newest first."""
+    rows = Supabase(url, key).select("feedback", f"select=id,source,title,company,location,url,reason"
+                                                 f"&order=marked_at.desc&limit={limit}")
+    return [r for r in rows if isinstance(r, dict) and r.get("id") and r.get("title")]

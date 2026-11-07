@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS triaged (             -- offers skipped before scorin
 CREATE TABLE IF NOT EXISTS reports (             -- weekly reports sent (so a backup schedule doesn't send twice)
     sent_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rescued (             -- skipped offers marked "interested" in the app, already re-queued
+    id         TEXT PRIMARY KEY,
+    rescued_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS seen (                -- ids skipped without scoring (e.g. empty description)
     id TEXT PRIMARY KEY
 );
@@ -269,6 +273,19 @@ class Store:
                    if hit(r["url"], r["title"], r["company"])]
         queued = [o for o in self.queued() if hit(o.get("url"), o.get("title"), o.get("company"))]
         return {"scored": scored, "skipped": skipped, "queued": queued}
+
+    def rescue(self, offers: list[dict]) -> int:
+        """Queue skipped offers the user marked "interested" (each only once, and not if already scored)."""
+        done = {r[0] for r in self.con.execute("SELECT id FROM rescued")}
+        done |= {r[0] for r in self.con.execute("SELECT id FROM offers")}
+        done |= {r[0] for r in self.con.execute("SELECT id FROM queue")}
+        new = [o for o in offers if o.get("id") and o["id"] not in done]
+        self.enqueue([{**o, "search_keyword": o.get("search_keyword") or "marked interested"} for o in new])
+        self.con.executemany("DELETE FROM seen WHERE id = ?", [(o["id"],) for o in new])
+        self.con.executemany("INSERT OR IGNORE INTO rescued(id, rescued_at) VALUES (?, ?)",
+                             [(o["id"], now_iso()) for o in new])
+        self.con.commit()
+        return len(new)
 
     def queue_size(self) -> int:
         return self.con.execute("SELECT COUNT(*) FROM queue").fetchone()[0]

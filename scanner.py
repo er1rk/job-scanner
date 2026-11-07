@@ -399,6 +399,11 @@ Drop ONLY offers that are clearly not a fit, for example:
 - a language requirement in the title the candidate does not speak.
 When unsure, KEEP the offer - a detailed review follows. Return the numbers of the offers to keep."""
 
+TRIAGE_LIKED = """### Offers the candidate marked as relevant after this pre-screen dropped them
+These were wrongly dropped before. KEEP offers like these - the same kind of role and seniority, even if the
+title words differ:
+{titles}"""
+
 TRIAGE_SCHEMA = {
     "type": "OBJECT",
     "properties": {"keep": {"type": "ARRAY", "items": {"type": "INTEGER"}}},
@@ -417,7 +422,9 @@ def triage_offers(offers: list[dict], profile: str, cfg: dict, api_key: str) -> 
         batch = offers[start:start + size]
         lines = "\n".join(f"{i}. {o.get('title', '')} | {o.get('company', '')} | {o.get('location', '')} | "
                           f"{sources.label(o.get('source'))}" for i, o in enumerate(batch, 1))
-        res = call_gemini(f"{TRIAGE_PROMPT}\n\n### Candidate profile\n{profile}\n\n### Offers\n{lines}",
+        liked = cfg.get("_liked") or []
+        hint = ("\n\n" + TRIAGE_LIKED.format(titles="\n".join(f"- {t}" for t in liked[:40]))) if liked else ""
+        res = call_gemini(f"{TRIAGE_PROMPT}{hint}\n\n### Candidate profile\n{profile}\n\n### Offers\n{lines}",
                           TRIAGE_SCHEMA, cfg, api_key, temperature=0.0)
         keep = {i for i in (res or {}).get("keep", []) if isinstance(i, int) and 1 <= i <= len(batch)}
         if res is None or "keep" not in res or (not keep and len(batch) >= 5):
@@ -685,6 +692,14 @@ def main() -> None:
                 print(f"Settings from the web app: {', '.join(sorted(app_settings))}")
         except Exception as e:
             print(f"Could not read settings from Supabase ({type(e).__name__}) - using config files")
+        try:
+            feedback = supabase_sync.load_feedback(sb_url, sb_key)
+        except Exception as e:
+            feedback = []
+            print(f"Could not read feedback from Supabase ({type(e).__name__})")
+        # titles you marked "interested" teach the AI pre-filter what to keep (few-shot examples in the prompt)
+        cfg["_liked"] = [" | ".join(x for x in (f.get("title"), f.get("company")) if x) for f in feedback]
+        cfg["_feedback"] = feedback
 
     # Optional overrides for manual test runs (set from the "Run workflow" form)
     manual_hours = os.getenv("HOURS", "") not in ("", "auto")  # "auto" = external trigger, like a schedule
@@ -738,6 +753,9 @@ def main() -> None:
     t0 = time.monotonic()
     budget = float(cfg.get("time_budget_minutes", 40)) * 60  # leave time for e-mails, report and saving the cache
 
+    rescued = store.rescue(cfg.get("_feedback") or [])
+    if rescued:
+        print(f"Marked interested in the app: {rescued} skipped offers queued for scoring")
     expired = store.expire_queue(int(cfg.get("queue_max_age_days", 7)))
     backlog = store.queued()  # offers left over from earlier runs go first
     new = fetch_offers(cfg, set() if ignore_seen else store.seen_ids(),

@@ -516,6 +516,40 @@ class TriageTests(unittest.TestCase):
                 kept, dropped = scanner.triage_offers(self.offers(6), "p", {}, "k")
             self.assertEqual((len(kept), len(dropped)), (6, 0), answer)
 
+    def test_offers_marked_interested_become_examples(self):
+        calls = []
+        def fake_call(prompt, schema, cfg, key, temperature=0.2):
+            calls.append(prompt)
+            return {"keep": [1]}
+        with mock.patch.object(scanner, "call_gemini", side_effect=fake_call), mock.patch("time.sleep"):
+            scanner.triage_offers(self.offers(2), "p", {"_liked": ["Fraud Specialist | Bank"]}, "k")
+            scanner.triage_offers(self.offers(2), "p", {}, "k")
+        self.assertIn("marked as relevant", calls[0])
+        self.assertIn("- Fraud Specialist | Bank", calls[0])
+        self.assertNotIn("marked as relevant", calls[1])
+
+    def test_marked_offers_are_rescued_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = EndToEndTests.run_main
+            def drop_all(offers, profile, cfg, key):
+                return [], offers
+            with mock.patch.object(scanner, "triage_offers", side_effect=drop_all):
+                run(self, tmp, [], {})                                      # offer 111 dropped by the AI
+            fb = [{"id": "111", "source": "linkedin", "title": "Junior Analyst", "company": "Acme",
+                   "location": "Warsaw", "url": "https://www.linkedin.com/jobs/view/111", "reason": "ai"}]
+            import supabase_sync
+            env = {"SUPABASE_URL": "https://x", "SUPABASE_SERVICE_KEY": "k"}
+            with mock.patch.object(supabase_sync, "load_settings", return_value={}), \
+                 mock.patch.object(supabase_sync, "load_feedback", return_value=fb), \
+                 mock.patch.object(supabase_sync, "sync", return_value={}), \
+                 mock.patch.object(scanner, "triage_offers", side_effect=lambda o, p, c, k: (o, [])) as tri:
+                run(self, tmp, [], {**env, "HOURS": "24"})
+            self.assertEqual(tri.call_args.args[2]["_liked"], ["Junior Analyst | Acme"])
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual(store.con.execute("SELECT id FROM offers").fetchall()[0][0], "111")  # scored now
+            self.assertEqual(store.rescue(fb), 0)                           # never queued twice
+            store.close()
+
     def test_switched_off(self):
         with mock.patch.object(scanner, "call_gemini") as call:
             kept, dropped = scanner.triage_offers(self.offers(3), "p", {"triage": False}, "k")
@@ -1050,6 +1084,15 @@ class SupabaseSyncTests(unittest.TestCase):
             got = supabase_sync.load_settings("https://x.supabase.co", "k")
         self.assertEqual(got, {"keywords": ["kyc analyst"], "min_score_to_notify": 55})
 
+    def test_feedback_is_read(self):
+        import supabase_sync
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = [{"id": "1", "title": "Analyst"}, {"id": "2", "title": None}, "junk"]
+        with mock.patch.object(supabase_sync.requests, "request", return_value=resp) as req:
+            got = supabase_sync.load_feedback("https://x.supabase.co", "k")
+        self.assertEqual(got, [{"id": "1", "title": "Analyst"}])
+        self.assertIn("feedback?select=", req.call_args.args[1])
+
     def test_errors_are_raised_without_row_data(self):
         import supabase_sync
         bad = mock.Mock(status_code=401, text='{"message":"Invalid API key"}')
@@ -1062,6 +1105,7 @@ class SupabaseSyncTests(unittest.TestCase):
         import supabase_sync
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(supabase_sync, "load_settings", return_value={"min_score_to_notify": 90}), \
+             mock.patch.object(supabase_sync, "load_feedback", return_value=[]), \
              mock.patch.object(supabase_sync, "sync", side_effect=RuntimeError("POST offers: 500")):
             send = EndToEndTests.run_main(self, tmp, [], {"SUPABASE_URL": "https://x", "SUPABASE_SERVICE_KEY": "k"},
                                           email_every_run=True)

@@ -91,6 +91,15 @@ class AppTests(unittest.TestCase):
         self.assertFalse(at.exception)
         self.assertEqual(LocalBackend(self.db).settings()["keywords"], ["kyc analyst", "aml analyst"])
 
+    def test_mark_skipped_offer_interested(self):
+        from data import LocalBackend
+        b = LocalBackend(self.db)
+        row = b.skipped().iloc[0].to_dict()
+        b.mark_interested([row])
+        self.assertEqual(list(b.feedback()["id"]), [row["id"]])
+        b.unmark_interested([row["id"]])
+        self.assertTrue(b.feedback().empty)
+
     def test_local_backend_tracking(self):
         from data import LocalBackend
         b = LocalBackend(self.db)
@@ -151,6 +160,19 @@ class SupabaseBackendTests(unittest.TestCase):
         upsert = next(a for n, a, k in c.calls[-1][1] if n == "upsert")[0]
         self.assertEqual((upsert["offer_id"], upsert["status"]), ("7", "applied"))
         self.assertNotIn("bogus", upsert)
+
+
+class FeedbackSupabaseTests(unittest.TestCase):
+    def test_mark_and_unmark(self):
+        from data import SupabaseBackend
+        c = FakeClient({})
+        b = SupabaseBackend(c)
+        b.mark_interested([{"id": "a", "title": "T", "extra": "ignored"}])
+        b.unmark_interested(["a"])
+        (t1, ops1), (t2, ops2) = c.calls
+        self.assertEqual((t1, ops1[0][0]), ("feedback", "upsert"))
+        self.assertNotIn("extra", ops1[0][1][0][0])
+        self.assertEqual((t2, [o[0] for o in ops2]), ("feedback", ["delete", "in_"]))
 
 
 class EmptySupabaseTests(unittest.TestCase):

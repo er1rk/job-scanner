@@ -32,7 +32,9 @@ COLUMNS = {
     "queue": ["id", "source", "title", "company", "location", "url", "queued_at"],
     "skipped": ["id", "source", "title", "company", "location", "url", "reason", "skipped_at"],
     "applications": APP_COLUMNS,
+    "feedback": ["id", "source", "title", "company", "location", "url", "reason", "marked_at"],
 }
+FEEDBACK_COLUMNS = ["id", "source", "title", "company", "location", "url", "reason"]
 
 
 def _frame(rows: list[dict], table: str) -> pd.DataFrame:
@@ -40,7 +42,7 @@ def _frame(rows: list[dict], table: str) -> pd.DataFrame:
     for c in COLUMNS.get(table, []):
         if c not in df:
             df[c] = pd.Series(dtype="object")
-    if table in ("queue", "skipped", "applications"):
+    if table in ("queue", "skipped", "applications", "feedback"):
         df = _text_none(df, [c for c in df.columns if c not in ("applied_on", "follow_up_on")])
     return df
 
@@ -117,6 +119,16 @@ class SupabaseBackend:
         row = {"offer_id": offer_id, **{k: v for k, v in fields.items() if k in APP_COLUMNS}, "updated_at": _now()}
         self.c.table("applications").upsert(row).execute()
 
+    def feedback(self):
+        return self._all("feedback", "marked_at")
+
+    def mark_interested(self, rows: list[dict]) -> None:
+        self.c.table("feedback").upsert([{k: r.get(k) for k in FEEDBACK_COLUMNS} | {"marked_at": _now()}
+                                         for r in rows]).execute()
+
+    def unmark_interested(self, ids: list[str]) -> None:
+        self.c.table("feedback").delete().in_("id", ids).execute()
+
     def settings(self) -> dict:
         return {r["key"]: r["value"] for r in self.c.table("settings").select("*").execute().data}
 
@@ -138,7 +150,22 @@ class LocalBackend:
             CREATE TABLE IF NOT EXISTS app_applications (offer_id TEXT PRIMARY KEY, status TEXT, applied_on TEXT,
                 follow_up_on TEXT, notes TEXT, updated_at TEXT);
             CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+            CREATE TABLE IF NOT EXISTS app_feedback (id TEXT PRIMARY KEY, source TEXT, title TEXT, company TEXT,
+                location TEXT, url TEXT, reason TEXT, marked_at TEXT);
         """)
+
+    def feedback(self):
+        return _frame([dict(r) for r in self.con.execute("SELECT * FROM app_feedback ORDER BY marked_at DESC")],
+                      "feedback")
+
+    def mark_interested(self, rows: list[dict]) -> None:
+        self.con.executemany("INSERT OR REPLACE INTO app_feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                             [tuple(r.get(k) for k in FEEDBACK_COLUMNS) + (_now(),) for r in rows])
+        self.con.commit()
+
+    def unmark_interested(self, ids: list[str]) -> None:
+        self.con.executemany("DELETE FROM app_feedback WHERE id = ?", [(i,) for i in ids])
+        self.con.commit()
 
     def _df(self, sql: str) -> pd.DataFrame:
         return pd.read_sql_query(sql, self.con)
