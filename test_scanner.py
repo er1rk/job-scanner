@@ -1114,3 +1114,103 @@ class SupabaseSyncTests(unittest.TestCase):
             st = Store(Path(tmp) / "jobs.db")
             self.assertEqual(st.count(), 1)                                  # scan finished and saved
             st.close()
+
+
+class SingleOfferTests(unittest.TestCase):
+    def test_links_map_to_the_ids_searches_use(self):
+        f = scanner.offer_from_url
+        self.assertEqual(f("https://www.linkedin.com/jobs/view/junior-analyst-at-acme-4012345678?trk=x")["id"], "4012345678")
+        self.assertEqual(f("https://www.linkedin.com/jobs/collections/recommended/?currentJobId=4011")["id"], "4011")
+        self.assertEqual(f("https://justjoin.it/job-offer/acme-analyst-warszawa?x=1")["id"], "jj:acme-analyst-warszawa")
+        self.assertEqual(f("https://rocketjobs.pl/oferta-pracy/acme-kyc")["source"], "rocketjobs")
+        self.assertEqual(f("https://nofluffjobs.com/pl/job/data-analyst-acme-remote")["id"], "nfj:data-analyst-acme-remote")
+        self.assertEqual(f("https://www.pracuj.pl/praca/analityk,oferta,1004")["source"], "pracuj")
+        web = f("https://careers.acme.com/jobs/123")
+        self.assertEqual(web["source"], "web")
+        self.assertEqual(web["id"], f("https://careers.acme.com/jobs/123")["id"])  # stable id
+        self.assertEqual(sources.label("web"), "Other site")
+
+    def gemini(self, *results):
+        replies = iter(results)
+        def post(*args, **kwargs):
+            r = mock.Mock(status_code=200)
+            r.json.return_value = {"candidates": [{"content": {"parts": [{"text": json.dumps(next(replies))}]}}],
+                                   "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}}
+            return r
+        return post
+
+    def score(self, url, page, *gemini):
+        store = Store(Path(":memory:"))
+        cfg = scanner.load_config()
+        with mock.patch.object(common, "get", return_value=page), \
+             mock.patch.object(scanner.requests, "post", side_effect=self.gemini(*gemini)), \
+             mock.patch.object(scanner.time, "sleep"):
+            row, problem = scanner.score_single(url, store, cfg, "profile", "k")
+        return store, row, problem
+
+    def test_career_page_is_read_and_scored(self):
+        page = ("<html><head><title>Data Analyst - Acme</title><script>var x=1</script></head><body>"
+                + "<p>We need Power BI and Excel. </p>" * 20 + "</body></html>")
+        meta = {"title": "Data Analyst", "company": "Acme", "location": "Warsaw", "is_job_offer": True}
+        store, row, problem = self.score("https://careers.acme.com/jobs/123", page, meta, GEMINI_RESULT)
+        self.assertEqual(problem, "")
+        self.assertEqual((row["title"], row["company"], row["score"], row["source"]), ("Data Analyst", "Acme", 82, "web"))
+        saved = store.con.execute("SELECT title, search_keyword, synced FROM offers").fetchone()
+        self.assertEqual(tuple(saved), ("Data Analyst", "scored on request", 0))   # synced to the app next
+        self.assertIn(row["id"], store.seen_ids())
+
+    def test_linkedin_link_uses_the_portal_reader(self):
+        page = '<div class="show-more-less-html__markup">' + "Power BI, Excel. " * 30 + "</div>"
+        meta = {"title": "Analyst", "company": "Acme", "location": "Warsaw", "is_job_offer": True}
+        store, row, _ = self.score("https://www.linkedin.com/jobs/view/999", page, meta, GEMINI_RESULT)
+        self.assertEqual((row["id"], row["source"]), ("999", "linkedin"))
+
+    def test_problems_are_reported_not_raised(self):
+        _, row, problem = self.score("https://x.com/a", None)
+        self.assertIsNone(row)
+        self.assertIn("could not be downloaded", problem)
+        _, row, problem = self.score("https://x.com/a", "<p>Login</p>")
+        self.assertIn("almost no text", problem)
+        page = "<p>" + "Our cookie policy. " * 30 + "</p>"
+        _, row, problem = self.score("https://x.com/a", page,
+                                     {"title": "", "company": "", "location": "", "is_job_offer": False})
+        self.assertIn("doesn't look like a job offer", problem)
+
+    def test_known_offer_keeps_its_details(self):
+        store = Store(Path(":memory:"))
+        store.save_triaged([{"id": "pracuj:55", "source": "pracuj", "title": "Analityk KYC", "company": "Bank",
+                             "location": "Łódź", "url": "https://www.pracuj.pl/praca/analityk-kyc,oferta,1004"}])
+        page = "<div>" + "Weryfikacja klientów, Excel. " * 20 + "</div>"
+        with mock.patch.object(common, "get", return_value=page), \
+             mock.patch.object(scanner.requests, "post", side_effect=self.gemini(GEMINI_RESULT)), \
+             mock.patch.object(scanner.time, "sleep"):
+            row, _ = scanner.score_single("https://www.pracuj.pl/praca/analityk-kyc,oferta,1004", store,
+                                          scanner.load_config(), "p", "k")
+        self.assertEqual((row["id"], row["title"]), ("pracuj:55", "Analityk KYC"))   # no title call needed
+
+    def test_main_scores_one_offer_without_scanning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = "<html><title>Analyst</title><body>" + "<p>Power BI. Excel.</p>" * 30 + "</body></html>"
+            meta = {"title": "Analyst", "company": "Acme", "location": "Remote", "is_job_offer": True}
+            cfg = scanner.load_config()
+            with mock.patch.object(scanner, "DB_FILE", Path(tmp) / "jobs.db"), \
+                 mock.patch.object(scanner, "SEEN_FILE", Path(tmp) / "seen.json"), \
+                 mock.patch.object(scanner, "DB_ENC_FILE", Path(tmp) / "jobs.db.enc"), \
+                 mock.patch.object(scanner, "load_config", return_value=cfg), \
+                 mock.patch.object(common, "get", return_value=page), \
+                 mock.patch.object(scanner.requests, "post", side_effect=self.gemini(meta, GEMINI_RESULT)), \
+                 mock.patch.object(scanner.time, "sleep"), \
+                 mock.patch.object(scanner, "fetch_offers") as search, \
+                 mock.patch.object(scanner, "send_html") as mail, \
+                 mock.patch.object(sys, "argv", ["scanner.py"]), \
+                 mock.patch.dict(os.environ, {"GEMINI_API_KEY": "x", "CANDIDATE_PROFILE": "p", "GITHUB_ACTIONS": "",
+                                              "DB_ENCRYPTION_KEY": "", "SCORE_URL": "https://jobs.acme.com/1"}):
+                scanner.main()
+            search.assert_not_called()
+            subject, body = mail.call_args.args
+            self.assertEqual(subject, "Single offer: 82/100 – Analyst")
+            self.assertIn("Strong reporting fit.", body)
+            store = Store(Path(tmp) / "jobs.db")
+            self.assertEqual(store.count(), 1)
+            self.assertEqual(store.con.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)  # not a scan
+            store.close()

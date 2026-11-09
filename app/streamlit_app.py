@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import html
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -24,10 +25,10 @@ from data import STATUSES, LocalBackend, SupabaseBackend  # noqa: E402
 st.set_page_config(page_title="AI Job Scanner", page_icon="🔎", layout="wide")
 
 PORTALS = {"linkedin": "LinkedIn", "pracuj": "pracuj.pl", "nofluffjobs": "No Fluff Jobs",
-           "justjoin": "justjoin.it", "rocketjobs": "RocketJobs"}
+           "justjoin": "justjoin.it", "rocketjobs": "RocketJobs", "web": "Other site"}
 # fixed categorical order, so a portal keeps its colour whatever the filter (validated palette)
 PORTAL_COLORS = {"LinkedIn": "#2a78d6", "pracuj.pl": "#eb6834", "No Fluff Jobs": "#1baf7a",
-                 "justjoin.it": "#eda100", "RocketJobs": "#e87ba4"}
+                 "justjoin.it": "#eda100", "RocketJobs": "#e87ba4", "Other site": "#8a8984"}
 ACCENT, MUTED = "#2a78d6", "#8a8984"
 REASONS = {"ai": "AI pre-filter", "title": "Title filter", "duplicate": "Duplicate"}
 
@@ -330,6 +331,26 @@ def page_home():
                 l2.link_button("Open offer ↗", o["url"], width="stretch")
 
 
+def score_one_offer():
+    """Paste a link from any job site -> the scanner scores it (whatever the filters say) and e-mails the result."""
+    with st.expander("➕ Score an offer from a link"):
+        with st.form("score-one", border=False, clear_on_submit=True):
+            c1, c2 = st.columns([5, 2], vertical_alignment="bottom")
+            url = c1.text_input("Link to the offer", placeholder="https://… (LinkedIn, pracuj.pl, a company career page…)")
+            go = c2.form_submit_button("Score it", type="primary", width="stretch")
+        if go:
+            url = url.strip()
+            if not re.match(r"https?://\S+\.\S+", url):
+                st.error("Paste the full link, starting with https://")
+            else:
+                ok, msg = dispatch_scan({"score_url": url})
+                if ok:
+                    st.success("Scoring started – the result comes by e-mail in about 2 minutes and appears in this "
+                               "list after **↻ Refresh data**.")
+                else:
+                    st.error(msg)
+
+
 def page_offers():
     backend, d = APP["backend"], APP["data"]
     if d["offers"].empty:
@@ -337,6 +358,7 @@ def page_offers():
         return
     offers = with_status(d["offers"], d["apps"])
     threshold = int(current(d).get("min_score_to_notify", 60))
+    score_one_offer()
     f1, f2, f3 = st.columns([3, 2, 2])
     query = f1.text_input("Search", placeholder="Search title, company or skill…", label_visibility="collapsed")
     days = f2.selectbox("Period", [1, 3, 7, 30, 3650], index=2, label_visibility="collapsed",

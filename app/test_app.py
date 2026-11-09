@@ -68,6 +68,20 @@ class AppTests(unittest.TestCase):
         self.assertEqual(row.applied_on, date.today().isoformat())
         self.assertEqual(row.follow_up_on, (date.today() + timedelta(days=7)).isoformat())
 
+    def test_score_an_offer_form(self):
+        from streamlit.testing.v1 import AppTest
+        env = {"APP_BACKEND": "local", "LOCAL_DB": self.db, "APP_START_PAGE": "offers", "GITHUB_TOKEN": ""}
+        with mock.patch.dict(os.environ, env):
+            at = AppTest.from_file(str(APP), default_timeout=60).run()
+            box = next(t for t in at.text_input if t.label == "Link to the offer")
+            box.set_value("not a link")
+            next(b for b in at.button if b.label == "Score it").click().run()
+            self.assertIn("full link", " ".join(e.value for e in at.error))
+            next(t for t in at.text_input if t.label == "Link to the offer").set_value("https://jobs.acme.com/1")
+            next(b for b in at.button if b.label == "Score it").click().run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertTrue(at.error)   # no GitHub token in tests -> the dispatch error is shown, nothing crashes
+
     def test_kanban_moves_to_next_stage(self):
         from data import LocalBackend
         from streamlit.testing.v1 import AppTest
