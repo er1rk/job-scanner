@@ -619,15 +619,23 @@ def page_market():
     if not daily.empty:
         # parts of a daily total -> stacked bars (fixed colour per portal, so filters never repaint them)
         order = [p for p in PORTAL_COLORS if p in set(daily["portal"])]
+        # one bar per calendar day (a time axis put several ticks on each day and made the bars hair-thin)
+        first = max(daily["day"].min(), date.today() - timedelta(days=days - 1))
+        all_days = [first + timedelta(days=i) for i in range((date.today() - first).days + 1)]
+        labels = [x.strftime("%d %b") for x in all_days]
+        daily = daily[daily["day"] >= first]
+        daily = daily.assign(label=daily["day"].map(lambda x: x.strftime("%d %b")),
+                             weekday=daily["day"].map(lambda x: x.strftime("%a %d %b")))
         stacked = (alt.Chart(daily, title="Offers scored per day, by portal", height=260)
                    .mark_bar(stroke="#fcfcfb", strokeWidth=1)
-                   .encode(x=alt.X("day:T", title=None, axis=alt.Axis(format="%d %b", labelAngle=0)),
+                   .encode(x=alt.X("label:O", title=None, scale=alt.Scale(domain=labels, paddingInner=0.25),
+                                   axis=alt.Axis(labelAngle=0, labelOverlap="greedy", ticks=False)),
                            y=alt.Y("sum(offers):Q", title=None),
                            color=alt.Color("portal:N", scale=alt.Scale(domain=order,
                                                                         range=[PORTAL_COLORS[p] for p in order]),
                                            sort=order, legend=alt.Legend(orient="top", title=None)),
                            order=alt.Order("portal_rank:Q"),
-                           tooltip=[alt.Tooltip("day:T", format="%a %d %b"), "portal:N", "offers:Q"])
+                           tooltip=[alt.Tooltip("weekday:N", title="day"), "portal:N", "offers:Q"])
                    .transform_calculate(portal_rank="indexof(" + str(order) + ", datum.portal)")
                    .configure_view(stroke=None).configure_axis(labelColor="#52514e", gridColor="#eceae6", domain=False))
         st.altair_chart(stacked, width="stretch")
