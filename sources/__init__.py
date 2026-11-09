@@ -10,5 +10,7 @@ ALL = {m.NAME: m for m in (linkedin, pracuj, nofluffjobs, justjoin, rocketjobs)}
 
 
 def label(name: str | None) -> str:
+    if name == "web":  # scored on request from a link to some other site
+        return "Other site"
     m = ALL.get(name or "linkedin")
     return m.LABEL if m else (name or "")

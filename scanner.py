@@ -628,6 +628,102 @@ def send_weekly_report(store: Store, cfg: dict, profile: str | None, api_key: st
     return {"stats": stats, "recs": recs, "html": body}
 
 
+# ---------------------------------------------------------------- score one offer on request
+META_SCHEMA = {"type": "object", "properties": {
+    "title": {"type": "string"}, "company": {"type": "string"}, "location": {"type": "string"},
+    "is_job_offer": {"type": "boolean"}}, "required": ["title", "company", "location", "is_job_offer"]}
+
+
+def offer_from_url(url: str) -> dict:
+    """Source and id for a pasted link - the same ids the searches use, so a later scan won't score it twice."""
+    import hashlib
+    u = url.strip()
+    m = re.search(r"linkedin\.com.*?(?:/jobs/view/(?:[^/?]*?-)?|currentJobId=)(\d+)", u)
+    if m:
+        return {"id": m.group(1), "source": "linkedin", "url": sources.linkedin.VIEW_URL.format(id=m.group(1))}
+    for name, prefix, host in (("justjoin", "jj", "justjoin.it"), ("rocketjobs", "rj", "rocketjobs.pl")):
+        m = re.search(rf"{re.escape(host)}/(?:job-offer|oferta-pracy)/([a-z0-9-]+)", u)
+        if m:
+            return {"id": f"{prefix}:{m.group(1)}", "source": name, "url": u.split("?")[0]}
+    m = re.search(r"nofluffjobs\.com/(?:[a-z]{2}/)?job/([A-Za-z0-9-]+)", u)
+    if m:
+        return {"id": f"nfj:{m.group(1)}", "source": "nofluffjobs", "url": u.split("?")[0]}
+    src = "pracuj" if "pracuj.pl" in u else "web"
+    return {"id": f"{src}:url:{hashlib.sha1(u.split('#')[0].encode()).hexdigest()[:16]}", "source": src, "url": u}
+
+
+def page_text(url: str) -> str | None:
+    """Readable text of any job page (company career sites too); None if it can't be downloaded."""
+    body = common.get(url)
+    if body is None:
+        return None
+    body = re.sub(r"<(script|style|noscript|svg|header|footer|nav)[^>]*>.*?</\1>", " ", body, flags=re.S | re.I)
+    head = re.search(r"<title[^>]*>(.*?)</title>", body, re.S | re.I)
+    text = common.html_to_text(body)
+    return (f"{common.html_to_text(head.group(1))}\n\n{text}" if head else text).strip()
+
+
+def score_single(url: str, store: Store, cfg: dict, profile: str, api_key: str) -> tuple[dict | None, str]:
+    """Score one pasted offer whatever the filters say. Returns (saved row or None, problem to report)."""
+    offer = offer_from_url(url)
+    known = store.find(url)
+    for o in known["scored"] + known["queued"] + known["skipped"]:  # already seen - keep its id and details
+        offer = {**offer, **{k: o[k] for k in ("id", "source", "title", "company", "location", "url") if o.get(k)}}
+        break
+    desc = None
+    src = sources.ALL.get(offer["source"])
+    if src:  # the portal's own reader knows its page / API format best
+        try:
+            desc = src.detail(offer)
+        except Exception:
+            desc = None
+    if not desc:  # unknown site or the portal's own reader failed - read the page itself
+        desc = page_text(offer["url"])
+    if desc is None:
+        return None, "The page could not be downloaded (the site may block automated requests or need a login)."
+    if len(desc) < 200:
+        return None, "The page has almost no text - the offer may have expired or the site needs a login."
+    if not (offer.get("title") and offer.get("company")):
+        meta = call_gemini("Read this web page and give the job title, the hiring company (or 'unknown') and the "
+                           f"location (or 'unknown'). Say whether it is a job offer.\n\n{desc[:6000]}",
+                           META_SCHEMA, cfg, api_key, temperature=0)
+        if not meta:
+            return None, "Gemini is unavailable right now - try again later."
+        if not meta.get("is_job_offer"):
+            return None, "This page doesn't look like a job offer."
+        offer = {**{k: meta.get(k) for k in ("title", "company", "location")}, **offer}
+    offer.setdefault("location", "unknown")
+    offer["search_keyword"] = "scored on request"
+    s = score_offer(offer, desc, profile, cfg, api_key)
+    if not s:
+        return None, "Gemini is unavailable right now - try again later."
+    row = {**offer, **s, "first_seen": now_iso(),
+           "fingerprint": common.fingerprint(offer.get("company"), offer.get("title"))}
+    store.save_offer(row, desc)
+    store.dequeue(row["id"])
+    store.mark_seen(row["id"])
+    return row, ""
+
+
+def build_single_email(url: str, row: dict | None, problem: str, threshold: int) -> str:
+    INK, INK2, MUTED, LINE = report.INK, report.INK2, report.MUTED, report.LINE
+    if row:
+        body = _offer_card(row, threshold)
+        title = f"Scored {row['score']}/100"
+    else:
+        body = (f"<tr><td><div style='background:#fff;border:1px solid {LINE};border-radius:10px;padding:14px 16px;"
+                f"font-size:13px;line-height:19px;color:{INK}'>⚠️ {html.escape(problem)}</div></td></tr>")
+        title = "Couldn't score this offer"
+    return (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+            f"</head><body style='margin:0;background:{report.PAGE}'><table role='presentation' width='100%' "
+            f"cellpadding='0' cellspacing='0'><tr><td align='center' style='padding:24px 12px'><table role='presentation' "
+            f"width='100%' cellpadding='0' cellspacing='0' style='max-width:640px;font-family:{report.FONT};color:{INK}'>"
+            f"<tr><td style='padding:0 2px 14px'><div style='font-size:12px;letter-spacing:.04em;text-transform:uppercase;"
+            f"color:{MUTED}'>Job scanner · single offer</div><div style='font-size:22px;font-weight:600;color:{INK};"
+            f"margin-top:2px'>{title}</div><div style='font-size:13px;color:{INK2};word-break:break-all'>"
+            f"{html.escape(url)}</div></td></tr>{body}</table></td></tr></table></body></html>")
+
+
 # ---------------------------------------------------------------- encrypted database
 def open_db() -> Store:
     """Decrypt data/jobs.db.enc (if present) and open the database.
@@ -724,6 +820,23 @@ def main() -> None:
         send_html(f"Find offer: {sum(len(v) for v in found.values())} match(es)",
                   build_find_email(os.environ["FIND"], found, cfg["min_score_to_notify"]))
         print(f"Find offer: {sum(len(v) for v in found.values())} match(es) e-mailed")  # count only - logs are public
+        close_db(store)
+        return
+    if os.getenv("SCORE_URL", "").strip():  # "Score one offer": a pasted link, scored whatever the filters say
+        url = os.environ["SCORE_URL"].strip()
+        row, problem = score_single(url, store, cfg, profile, api_key)
+        print("Single offer: scored" if row else "Single offer: not scored")  # no details - logs are public
+        try:
+            send_html(f"Single offer: {row['score']}/100 – {row['title']}" if row else "Single offer: couldn't score it",
+                      build_single_email(url, row, problem, cfg["min_score_to_notify"]))
+        except Exception as e:
+            print(f"E-mail failed: {type(e).__name__}", file=sys.stderr)
+        if row and sb_url and sb_key:
+            try:
+                supabase_sync.sync(store, sb_url, sb_key, cfg)
+                print("Supabase sync done")
+            except Exception as e:
+                print(f"Supabase sync failed: {str(e)[:200]}", file=sys.stderr)
         close_db(store)
         return
     backup = os.getenv("BACKUP_RUN", "").lower() == "true"
