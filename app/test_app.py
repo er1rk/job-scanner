@@ -82,6 +82,16 @@ class AppTests(unittest.TestCase):
         self.assertFalse(at.exception, [e.value for e in at.exception])
         self.assertTrue(at.error)   # no GitHub token in tests -> the dispatch error is shown, nothing crashes
 
+    def test_offers_can_be_sorted_newest_first(self):
+        from streamlit.testing.v1 import AppTest
+        with mock.patch.dict(os.environ, {"APP_BACKEND": "local", "LOCAL_DB": self.db, "APP_START_PAGE": "offers"}):
+            at = AppTest.from_file(str(APP), default_timeout=60).run()
+            self.assertIn("best first", " ".join(c.value for c in at.caption))
+            at.selectbox(key="offers-sort").select("Newest first").run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertIn("newest first", " ".join(c.value for c in at.caption))
+        self.assertTrue(any(" ago" in m.value for m in at.markdown))
+
     def test_kanban_moves_to_next_stage(self):
         from data import LocalBackend
         from streamlit.testing.v1 import AppTest
