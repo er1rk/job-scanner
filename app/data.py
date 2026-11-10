@@ -122,6 +122,10 @@ class SupabaseBackend:
     def feedback(self):
         return self._all("feedback", "marked_at")
 
+    def cv(self, offer_id: str) -> dict | None:
+        rows = self.c.table("cvs").select("*").eq("offer_id", offer_id).execute().data
+        return rows[0] if rows else None
+
     def mark_interested(self, rows: list[dict]) -> None:
         self.c.table("feedback").upsert([{k: r.get(k) for k in FEEDBACK_COLUMNS} | {"marked_at": _now()}
                                          for r in rows]).execute()
@@ -157,6 +161,9 @@ class LocalBackend:
     def feedback(self):
         return _frame([dict(r) for r in self.con.execute("SELECT * FROM app_feedback ORDER BY marked_at DESC")],
                       "feedback")
+
+    def cv(self, offer_id: str) -> dict | None:  # CVs live only in Supabase
+        return None
 
     def mark_interested(self, rows: list[dict]) -> None:
         self.con.executemany("INSERT OR REPLACE INTO app_feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

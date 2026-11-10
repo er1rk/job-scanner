@@ -140,6 +140,15 @@ alter table offers add column if not exists score_education    int;
 alter table offers add column if not exists score_languages    int;
 alter table offers add column if not exists score_extras       int;
 
+-- tailored CVs from the app's "Generate CV" (one per offer, the latest); written by the scanner
+create table if not exists cvs (
+  offer_id   text primary key,
+  file_name  text,
+  pdf_base64 text,
+  answers    jsonb,
+  created_at timestamptz default now()
+);
+
 alter table offers       enable row level security;
 alter table runs         enable row level security;
 alter table queue        enable row level security;
@@ -148,6 +157,7 @@ alter table applications enable row level security;
 alter table settings     enable row level security;
 alter table effective_settings enable row level security;
 alter table feedback     enable row level security;
+alter table cvs          enable row level security;
 
 -- read: any logged-in user (sign-ups are disabled, so that's only you)
 drop policy if exists "read offers" on offers;             create policy "read offers"   on offers   for select to authenticated using (true);
@@ -157,5 +167,6 @@ drop policy if exists "read skipped" on skipped;           create policy "read s
 drop policy if exists "read effective" on effective_settings; create policy "read effective" on effective_settings for select to authenticated using (true);
 -- read + write: your own data
 drop policy if exists "own applications" on applications;  create policy "own applications" on applications for all to authenticated using (true) with check (true);
+drop policy if exists "read cvs" on cvs;                  create policy "read cvs"         on cvs          for select to authenticated using (true);
 drop policy if exists "own feedback" on feedback;          create policy "own feedback"     on feedback     for all to authenticated using (true) with check (true);
 drop policy if exists "own settings" on settings;          create policy "own settings"     on settings     for all to authenticated using (true) with check (true);

@@ -10,6 +10,7 @@ from unittest import mock
 
 import report
 import scanner
+import supabase_sync
 import sources
 from sources import common, justjoin, nofluffjobs, pracuj, rocketjobs
 from storage import Store
@@ -1243,3 +1244,102 @@ class ScorePartsTests(unittest.TestCase):
         store = Store(Path(":memory:"))
         store.save_offer({"id": "x", **r})
         self.assertEqual(store.con.execute("SELECT score_education FROM offers").fetchone()[0], 6)
+
+
+def _weasy():
+    try:
+        import weasyprint  # noqa: F401 - needs the Pango system library
+        return True
+    except Exception:
+        return False
+
+
+class CvTests(unittest.TestCase):
+    def master(self):
+        import yaml, cv
+        return yaml.safe_load((cv.ROOT / "cv_master.example.yaml").read_text(encoding="utf-8")) | {
+            "experience": [
+                {"id": "old", "title": "Analyst", "company": "Old Co", "dates": "2020 – 2021", "start": "2020-01",
+                 "end": "2021-01", "bullets": ["Did old things."]},
+                {"id": "new", "title": "Specialist", "company": "New Co", "dates": "2024 – 2025", "start": "2024-01",
+                 "end": "2025-06", "bullets": ["Did new things."]}]}
+
+    def test_model_can_only_pick_and_reword(self):
+        import cv
+        t = {"profile": "Tailored profile.",
+             "experience": [{"id": "old", "bullets": ["Reworded old bullet."]}, {"id": "ghost", "bullets": ["x"]}],
+             "skills": [{"label": "Languages", "items": ["english c2", "German C1"]},
+                        {"label": "Invented", "items": ["Kubernetes"]}],
+             "coursework": ["NLP", "Quantum Physics"], "project_bullets": [[]]}
+        out = cv.merge(self.master(), t)
+        self.assertEqual([r["id"] for r in out["experience"]], ["new", "old"])        # most recent first
+        self.assertEqual(out["experience"][1]["bullets"], ["Reworded old bullet."])
+        self.assertEqual(out["experience"][0]["bullets"], ["Did new things."])        # fallback to the master
+        self.assertEqual(out["skills"][0], ("Languages", ["English C2"]))              # German C1 not in master
+        self.assertNotIn("Invented", dict(out["skills"]))
+        self.assertIn("Excel", dict(out["skills"]))                                    # rows are never lost
+        self.assertEqual(out["education"][0]["coursework"], ["NLP"])
+        self.assertEqual(out["projects"][0]["bullets"], ["Built an example tool."])
+        self.assertEqual(out["profile"], "Tailored profile.")
+
+    @unittest.skipUnless(_weasy(), "WeasyPrint/Pango not installed")
+    def test_long_cv_is_trimmed_to_one_page(self):
+        import cv, re as _re
+        m = self.master()
+        for r in m["experience"]:
+            r["bullets"] = [f"Long bullet number {i} " + "with plenty of words " * 6 for i in range(5)]
+        m["experience"] *= 3
+        for i, r in enumerate(m["experience"]):
+            m["experience"][i] = {**r, "id": f"r{i}"}
+        doc = cv.fit(cv.merge(m, {}))
+        self.assertEqual(len(doc.pages), 1)
+        self.assertTrue(doc.write_pdf().startswith(b"%PDF"))
+
+    def test_cv_run_mails_the_pdf_and_saves_it(self):
+        import yaml, cv
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "jobs.db")
+            store.save_offer({"id": "o1", "source": "linkedin", "title": "Analyst", "company": "Acme",
+                              "location": "Warsaw", "url": "https://x", "score": 70}, "We need Excel. " * 50)
+            store.close()
+            answer = {"profile": "P.", "experience": [], "project_bullets": [], "skills": [], "coursework": [],
+                      "answers": [{"question": "Why us?", "answer": "Because."}]}
+            cfg = scanner.load_config()
+            with mock.patch.object(scanner, "DB_FILE", Path(tmp) / "jobs.db"), \
+                 mock.patch.object(scanner, "SEEN_FILE", Path(tmp) / "seen.json"), \
+                 mock.patch.object(scanner, "DB_ENC_FILE", Path(tmp) / "jobs.db.enc"), \
+                 mock.patch.object(scanner, "load_config", return_value=cfg), \
+                 mock.patch.object(scanner, "call_gemini", return_value=answer) as gem, \
+                 mock.patch.object(cv, "render_pdf", return_value=b"%PDF-fake"), \
+                 mock.patch.object(scanner, "send_html") as mail, \
+                 mock.patch.object(scanner, "fetch_offers") as search, \
+                 mock.patch.object(supabase_sync, "load_settings", return_value={"cv_salary": "8 000 PLN"}), \
+                 mock.patch.object(supabase_sync, "load_feedback", return_value=[]), \
+                 mock.patch.object(supabase_sync, "save_cv") as save, \
+                 mock.patch.object(sys, "argv", ["scanner.py"]), \
+                 mock.patch.dict(os.environ, {"GEMINI_API_KEY": "x", "CANDIDATE_PROFILE": "p", "GITHUB_ACTIONS": "",
+                                              "DB_ENCRYPTION_KEY": "", "CV_OFFER": "o1",
+                                              "SUPABASE_URL": "https://s", "SUPABASE_SERVICE_KEY": "k",
+                                              "CV_MASTER": (cv.ROOT / "cv_master.example.yaml").read_text()}):
+                scanner.main()
+            search.assert_not_called()
+            self.assertIn("exactly this expectation: 8 000 PLN", gem.call_args.args[0])
+            self.assertEqual(gem.call_args.args[2]["gemini_models"][0], "gemini-flash-latest")
+            subject, body = mail.call_args.args
+            self.assertEqual(subject, "CV: Analyst – Acme")
+            self.assertIn("Because.", body)
+            self.assertEqual(mail.call_args.kwargs["files"], [("CV_Jane_Doe_Acme.pdf", b"%PDF-fake")])
+            self.assertEqual(save.call_args.args[2:4], ("o1", "CV_Jane_Doe_Acme.pdf"))
+
+    def test_problems_are_mailed(self):
+        store = Store(Path(":memory:"))
+        offer, name, pdf, problem = scanner.make_cv("nope", store, scanner.load_config(), "p", "k")
+        self.assertIsNone(pdf)
+        self.assertIn("isn't in the scanner's database", problem)
+        self.assertIn("isn&#x27;t in the scanner", scanner.build_cv_email(offer, None, problem))
+
+    def test_text_settings_from_the_app(self):
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = [{"key": "cv_salary", "value": " 8 000 PLN "}, {"key": "cv_availability", "value": 5}]
+        with mock.patch.object(supabase_sync.requests, "request", return_value=resp):
+            self.assertEqual(supabase_sync.load_settings("https://x", "k"), {"cv_salary": "8 000 PLN"})

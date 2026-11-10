@@ -1,0 +1,33 @@
+# Master CV for the CV generator - the ONLY facts a tailored CV may use (plus CANDIDATE_PROFILE).
+# Your real one goes into the CV_MASTER secret (or a git-ignored cv_master.yaml locally) - never commit it.
+name: Jane Doe
+contact: [jane@example.com, "+48 000 000 000", Poland]
+profile: >
+  Analyst with two years of experience in data quality and reporting.
+experience:              # any order - the CV lists them most recent first
+  - id: acme
+    title: Data Analyst
+    company: Acme Corp
+    dates: January 2022 – January 2024
+    start: 2022-01
+    end: 2024-01
+    location: Warsaw, Poland
+    bullets:             # your best wording - the generator picks, orders and lightly rewords these
+      - Analysed large datasets to find patterns and anomalies.
+    facts:               # other true facts it may turn into bullets when an offer asks for them
+      - Completed GDPR training.
+projects:
+  - title: Example project
+    subtitle: personal project · Python
+    dates: 2026 · github.com/example
+    bullets: [Built an example tool.]
+skills:                  # label -> items; the generator reorders and picks, never adds
+  Excel: [pivot tables, Power Query]
+  Languages: [Polish (native), English C2]
+education:
+  - degree: B.Sc. Business Administration
+    school: Example University
+    dates: Expected 2027
+    coursework: [Business Intelligence, NLP]
+certificates: [English C2 · EF SET · 2025]
+footer: I hereby consent to the processing of my personal data for the purposes of the recruitment process.

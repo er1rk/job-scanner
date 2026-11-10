@@ -581,7 +581,7 @@ def build_email(results: list[dict], csv_text: str | None = None, warning: str =
 
 
 def send_html(subject: str, body_html: str, csv_text: str | None = None,
-              extra: list[tuple[str, str]] | None = None) -> None:
+              extra: list[tuple[str, str]] | None = None, files: list[tuple[str, bytes]] | None = None) -> None:
     sender, password = os.getenv("EMAIL_ADDRESS"), os.getenv("EMAIL_APP_PASSWORD")
     if not (sender and password):
         print("E-mail not configured - skipping notification")
@@ -596,6 +596,8 @@ def send_html(subject: str, body_html: str, csv_text: str | None = None,
                            filename=f"jobs_{date.today():%Y-%m-%d}.csv")
     for name, text in extra or []:
         msg.add_attachment(text.encode("utf-8"), maintype="text", subtype="csv", filename=name)
+    for name, data in files or []:
+        msg.add_attachment(data, maintype="application", subtype="pdf", filename=name)
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(sender, password)
         smtp.send_message(msg)
@@ -763,6 +765,52 @@ def build_single_email(url: str, row: dict | None, problem: str, threshold: int)
             f"{html.escape(url)}</div></td></tr>{body}</table></td></tr></table></body></html>")
 
 
+# ---------------------------------------------------------------- tailored CV on request
+def build_cv_email(offer: dict, answers: list[dict] | None, problem: str = "") -> str:
+    INK, INK2, MUTED, LINE = report.INK, report.INK2, report.MUTED, report.LINE
+    esc = lambda v: html.escape(str(v or ""))
+    if answers is None:
+        body = (f"<div style='background:#fff;border:1px solid {LINE};border-radius:10px;padding:14px 16px;"
+                f"font-size:13px;color:{INK}'>⚠️ {esc(problem)}</div>")
+    else:
+        body = (f"<div style='font-size:13px;color:{INK2};margin-bottom:12px'>The CV is attached. Read it once before "
+                f"sending - it only uses facts from your master CV, but check the wording. Answers for the "
+                f"application form:</div>" + "".join(
+                    f"<div style='background:#fff;border:1px solid {LINE};border-radius:10px;padding:12px 16px;"
+                    f"margin-bottom:10px'><div style='font-size:13px;font-weight:600;color:{INK}'>{esc(a['question'])}"
+                    f"</div><div style='font-size:13px;line-height:20px;color:{INK};margin-top:4px;white-space:pre-wrap'>"
+                    f"{esc(a['answer'])}</div></div>" for a in answers))
+    link = f"<a href='{esc(offer.get('url'))}' style='color:#2a78d6'>open the offer</a>" if offer.get("url") else ""
+    return (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+            f"</head><body style='margin:0;background:{report.PAGE}'><table role='presentation' width='100%' "
+            f"cellpadding='0' cellspacing='0'><tr><td align='center' style='padding:24px 12px'><table role='presentation' "
+            f"width='100%' cellpadding='0' cellspacing='0' style='max-width:640px;font-family:{report.FONT};color:{INK}'>"
+            f"<tr><td><div style='font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:{MUTED}'>"
+            f"Job scanner · tailored CV</div><div style='font-size:22px;font-weight:600;margin:2px 0'>"
+            f"{esc(offer.get('title'))}</div><div style='font-size:13px;color:{INK2};margin-bottom:14px'>"
+            f"{esc(offer.get('company'))} · {esc(offer.get('location'))} {('· ' + link) if link else ''}</div>"
+            f"{body}</td></tr></table></td></tr></table></body></html>")
+
+
+def make_cv(offer_id: str, store: Store, cfg: dict, profile: str, api_key: str):
+    """Returns (offer, file name, pdf, answers) - pdf None plus a problem text when it can't be made."""
+    import cv
+    row = store.con.execute("SELECT * FROM offers WHERE id = ?", (offer_id,)).fetchone()
+    if not row:
+        return {"id": offer_id}, None, None, "This offer isn't in the scanner's database (yet)."
+    offer = dict(row)
+    master = cv.load_master()
+    if not master:
+        return offer, None, None, "No master CV - add it as the CV_MASTER secret (see cv_master.example.yaml)."
+    desc = store.description(offer_id)
+    if not desc:
+        return offer, None, None, "The offer's description wasn't saved, so the CV can't be tailored to it."
+    pdf, answers = cv.generate(offer, desc, master, profile, cfg, api_key, call_gemini)
+    if pdf is None:
+        return offer, None, None, answers
+    return offer, cv.file_name(master, offer), pdf, answers
+
+
 # ---------------------------------------------------------------- encrypted database
 def open_db() -> Store:
     """Decrypt data/jobs.db.enc (if present) and open the database.
@@ -859,6 +907,24 @@ def main() -> None:
         send_html(f"Find offer: {sum(len(v) for v in found.values())} match(es)",
                   build_find_email(os.environ["FIND"], found, cfg["min_score_to_notify"]))
         print(f"Find offer: {sum(len(v) for v in found.values())} match(es) e-mailed")  # count only - logs are public
+        close_db(store)
+        return
+    if os.getenv("CV_OFFER", "").strip():  # "Generate CV" from the app
+        offer, name, pdf, extra = make_cv(os.environ["CV_OFFER"].strip(), store, cfg, profile, api_key)
+        print("CV generated" if pdf else "CV not generated")  # no details - logs are public
+        try:
+            send_html(f"CV: {offer.get('title') or 'offer'} – {offer.get('company') or ''}" if pdf
+                      else "CV: couldn't generate it",
+                      build_cv_email(offer, extra if pdf else None, "" if pdf else extra),
+                      files=[(name, pdf)] if pdf else None)
+        except Exception as e:
+            print(f"E-mail failed: {type(e).__name__}", file=sys.stderr)
+        if pdf and sb_url and sb_key:
+            try:
+                supabase_sync.save_cv(sb_url, sb_key, offer["id"], name, pdf, extra)
+                print("CV saved to the app")
+            except Exception as e:
+                print(f"Saving the CV to the app failed: {str(e)[:200]}", file=sys.stderr)
         close_db(store)
         return
     if os.getenv("SCORE_URL", "").strip():  # "Score one offer": a pasted link, scored whatever the filters say

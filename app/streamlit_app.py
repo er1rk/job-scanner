@@ -451,6 +451,32 @@ def breakdown_html(o) -> str:
     return "<div class='jc-parts'>" + "".join(rows) + "</div>"
 
 
+def cv_section(backend, o) -> None:
+    """Generate a CV tailored to this offer (GitHub Actions + Gemini) and download the latest one."""
+    try:
+        made = backend.cv(o["id"])
+    except Exception:  # cvs table not created yet
+        made = None
+    c1, c2 = st.columns(2)
+    if c1.button("📄 Generate CV" if not made else "📄 New CV", key=f"cv-{o['id']}", width="stretch"):
+        ok, msg = dispatch_scan({"cv_offer": str(o["id"])})
+        if ok:
+            st.success("Generating – the CV comes by e-mail in about 2 minutes and appears here after "
+                       "**↻ Refresh data**.")
+        else:
+            st.error(msg)
+    if made:
+        import base64
+        c2.download_button("⬇ Download CV", base64.b64decode(made["pdf_base64"]), file_name=made["file_name"],
+                           mime="application/pdf", key=f"cvd-{o['id']}", width="stretch")
+        when = pd.to_datetime(made.get("created_at"), utc=True)
+        with st.expander(f"Form answers · CV from {when.tz_convert('Europe/Warsaw'):%d %b %H:%M}"
+                         if pd.notna(when) else "Form answers"):
+            for a in made.get("answers") or []:
+                st.markdown(f"**{a.get('question', '')}**")
+                st.code(a.get("answer", ""), language=None, wrap_lines=True)
+
+
 def offer_detail(backend, o, d, threshold: int):
     with st.container(border=True):
         st.markdown(card_html(o, threshold, big=True), unsafe_allow_html=True)
@@ -470,6 +496,7 @@ def offer_detail(backend, o, d, threshold: int):
         quick_actions(backend, d, o, f"detail-{o['id']}")
         if clean(o.get("url")):
             st.link_button("Open offer ↗", o["url"], width="stretch")
+        cv_section(backend, o)
 
         apps = d["apps"]
         mine = apps[apps["offer_id"] == o["id"]]
@@ -571,10 +598,16 @@ def page_scanner():
         inc = c3.text_area("Title must contain one of", "\n".join(s.get("include_title_keywords", [])), height=140)
         exc = c4.text_area("Skip titles with (whole words, * = stem)", "\n".join(s.get("exclude_title_keywords", [])), height=140)
         score = st.number_input("Minimum score for the e-mail", 0, 100, int(s.get("min_score_to_notify", 60)), step=5)
+        st.markdown("**For generated CVs** – used in the form answers; leave empty to get a placeholder")
+        c5, c6 = st.columns(2)
+        salary = c5.text_input("Salary expectation", s.get("cv_salary", ""), placeholder="e.g. 8 000 PLN gross / month")
+        avail = c6.text_input("Availability / notice period", s.get("cv_availability", ""),
+                              placeholder="e.g. available immediately")
         if st.form_submit_button("Save settings", type="primary"):
             lines = lambda t: [x.strip() for x in t.splitlines() if x.strip()]
             for key, val in (("keywords", lines(kw)), ("locations", lines(loc)), ("include_title_keywords", lines(inc)),
-                             ("exclude_title_keywords", lines(exc)), ("min_score_to_notify", int(score))):
+                             ("exclude_title_keywords", lines(exc)), ("min_score_to_notify", int(score)),
+                             ("cv_salary", salary.strip()), ("cv_availability", avail.strip())):
                 backend.save_setting(key, val)
             d["settings"] = backend.settings()
             st.toast("Settings saved – used from the next scan")

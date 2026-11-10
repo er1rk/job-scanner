@@ -42,6 +42,9 @@ on:
       score_url:
         description: "Score one offer: paste a link from any job site - scored and e-mailed (no scan)"
         default: ""
+      cv_offer:
+        description: "Generate a tailored CV for this offer id (used by the web app; no scan)"
+        default: ""
 
 # Never run two scans at once: both would restore the same database and the later save would overwrite
 # the earlier one. A second run waits for the first.
@@ -85,6 +88,10 @@ jobs:
           key: jobdb-enc-${{ github.run_id }}
           restore-keys: jobdb-enc-
 
+      - name: PDF libraries for the CV generator
+        if: inputs.cv_offer != ''
+        run: sudo apt-get install -y -q libpango-1.0-0 libpangoft2-1.0-0 > /dev/null
+
       - name: Scan and score offers
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -102,6 +109,8 @@ jobs:
           SEND_REPORT: ${{ inputs.send_report }}
           FIND: ${{ inputs.find }}
           SCORE_URL: ${{ inputs.score_url }}
+          CV_OFFER: ${{ inputs.cv_offer }}
+          CV_MASTER: ${{ secrets.CV_MASTER }}
           # Every scheduled or external run skips itself if today's scan / report already happened, so the
           # external trigger and GitHub's own (unreliable) schedule never send the same e-mail twice.
           BACKUP_RUN: ${{ github.event_name == 'schedule' || inputs.auto }}
