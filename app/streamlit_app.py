@@ -227,7 +227,8 @@ def card_html(o, threshold: int, big: bool = False) -> str:
     esc = lambda v: html.escape(str(v)) if clean(v) is not None else ""
     status = clean(o.get("status"))
     badge = f"<span class='jc-status'>{STATUS_LABEL.get(status, status)}</span>" if status else ""
-    meta = " · ".join(esc(x) for x in (o.get("company"), o.get("location"), o.get("portal")) if clean(x))
+    meta = " · ".join(esc(x) for x in (o.get("company"), o.get("location"), o.get("portal"), ago(o.get("first_seen")))
+                      if clean(x))
     en = clean(o.get("english_level"))
     chips = [o.get("salary"), clean(o.get("work_mode")) if clean(o.get("work_mode")) != "unknown" else None,
              ", ".join(clean(o.get("contract_types")) or []) or None,
@@ -357,6 +358,19 @@ def score_one_offer():
                     st.error(msg)
 
 
+SORTS = {"Best match first": (["score", "first_seen"], "best first"),
+         "Newest first": (["first_seen", "score"], "newest first"),
+         "Highest salary first": (["salary_max_pln_month", "score"], "highest salary first")}
+
+
+def ago(ts) -> str:
+    """'3 h ago' / '2 d ago' for when the scanner found the offer."""
+    if ts is None or pd.isna(ts):
+        return ""
+    h = (pd.Timestamp.now(tz="UTC") - ts).total_seconds() / 3600
+    return "just now" if h < 1 else f"{h:.0f} h ago" if h < 48 else f"{h / 24:.0f} d ago"
+
+
 def page_offers():
     backend, d = APP["backend"], APP["data"]
     if d["offers"].empty:
@@ -365,12 +379,13 @@ def page_offers():
     offers = with_status(d["offers"], d["apps"])
     threshold = int(current(d).get("min_score_to_notify", 60))
     score_one_offer()
-    f1, f2, f3 = st.columns([3, 2, 2])
+    f1, f2, f3, f4 = st.columns([3, 2, 2, 2])
     query = f1.text_input("Search", placeholder="Search title, company or skill…", label_visibility="collapsed")
     days = f2.selectbox("Period", [1, 3, 7, 30, 3650], index=2, label_visibility="collapsed",
                         format_func=lambda v: "All time" if v > 365 else f"Last {v} day{'s' if v > 1 else ''}")
     min_score = f3.slider("Min score", 0, 100, threshold, step=5, label_visibility="collapsed",
                           help="Minimum score")
+    order = f4.selectbox("Sort", list(SORTS), key="offers-sort", label_visibility="collapsed")
     with st.expander("More filters"):
         g1, g2, g3, g4 = st.columns(4)
         portals = g1.multiselect("Portal", sorted(offers["portal"].dropna().unique()))
@@ -389,14 +404,15 @@ def page_offers():
     for col, sel in (("portal", portals), ("role_category", cats), ("work_mode", modes)):
         if sel:
             df = df[df[col].isin(sel)]
-    df = df.sort_values(["score", "first_seen"], ascending=False)
+    cols, caption = SORTS[order]
+    df = df.sort_values(cols, ascending=False, na_position="last")
 
     sel_id = st.session_state.get("sel")
     with st.container(key="offers-layout"):
         left, right = st.columns([5, 6], gap="medium")
         with left:
             shown = st.session_state.get("shown", 20)
-            st.caption(f"{len(df)} offers · best first")
+            st.caption(f"{len(df)} offers · {caption}")
             for _, o in df.head(shown).iterrows():
                 key = ("sel-" if o["id"] == sel_id else "card-") + hashlib.md5(str(o["id"]).encode()).hexdigest()[:10]
                 with st.container(border=True, key=key):
