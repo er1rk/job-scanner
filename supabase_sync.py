@@ -27,6 +27,7 @@ OFFER_COLUMNS = [
     "salary_min_pln_month", "salary_max_pln_month", "years_required", "english_level", "polish_required",
     "required_tools", "nice_to_have_tools", "model",
 ]
+SCORE_PART_COLUMNS = ["score_requirements", "score_experience", "score_education", "score_languages", "score_extras"]
 JSON_COLUMNS = {"strengths", "gaps", "contract_types", "required_tools", "nice_to_have_tools"}
 RUN_COLUMNS = [
     "run_id", "started_at", "finished_at", "window_hours", "cards_found", "filtered_title", "new_offers",
@@ -60,8 +61,8 @@ class Supabase:
         return self._call("GET", f"{table}?{query}").json()
 
 
-def _offer_row(r) -> dict:
-    row = {c: r[c] for c in OFFER_COLUMNS}
+def _offer_row(r, parts: bool = True) -> dict:
+    row = {c: r[c] for c in OFFER_COLUMNS + (SCORE_PART_COLUMNS if parts else [])}
     for c in JSON_COLUMNS:
         row[c] = json.loads(row[c]) if row[c] else []
     row["notified"] = bool(row["notified"])
@@ -73,8 +74,15 @@ def sync(store, url: str, key: str, cfg: dict | None = None) -> dict:
     """Send what changed since the last sync. Returns counts (safe to log)."""
     sb = Supabase(url, key)
     con = store.con
-    pending = con.execute(f"SELECT {', '.join(OFFER_COLUMNS)} FROM offers WHERE synced = 0").fetchall()
-    sb.upsert("offers", [_offer_row(r) for r in pending])
+    pending = con.execute(f"SELECT {', '.join(OFFER_COLUMNS + SCORE_PART_COLUMNS)} FROM offers "
+                          "WHERE synced = 0").fetchall()
+    try:
+        sb.upsert("offers", [_offer_row(r) for r in pending])
+    except RuntimeError as e:  # Supabase without the newer score columns: sync the rest, say what to do
+        if "score_" not in str(e):
+            raise
+        print("Supabase has no score-part columns yet - run supabase/schema.sql again to show the breakdown")
+        sb.upsert("offers", [_offer_row(r, parts=False) for r in pending])
     con.executemany("UPDATE offers SET synced = 1 WHERE id = ?", [(r["id"],) for r in pending])
     con.commit()
 
