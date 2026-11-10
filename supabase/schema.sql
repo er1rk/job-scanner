@@ -133,6 +133,13 @@ create table if not exists feedback (
   marked_at timestamptz default now()
 );
 
+-- parts of the score (added later - safe to run again)
+alter table offers add column if not exists score_requirements int;
+alter table offers add column if not exists score_experience   int;
+alter table offers add column if not exists score_education    int;
+alter table offers add column if not exists score_languages    int;
+alter table offers add column if not exists score_extras       int;
+
 alter table offers       enable row level security;
 alter table runs         enable row level security;
 alter table queue        enable row level security;

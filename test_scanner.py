@@ -1214,3 +1214,32 @@ class SingleOfferTests(unittest.TestCase):
             self.assertEqual(store.count(), 1)
             self.assertEqual(store.con.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)  # not a scan
             store.close()
+
+
+class ScorePartsTests(unittest.TestCase):
+    def test_parts_are_clamped_and_added_up(self):
+        self.assertEqual(scanner.total_score({"score_requirements": 34, "score_experience": 18, "score_education": 8,
+                                              "score_languages": 10, "score_extras": 5}), (75, "apply"))
+        self.assertEqual(scanner.total_score({"score_requirements": 99, "score_experience": -5}), (40, "skip"))
+        self.assertEqual(scanner.total_score({"score_requirements": 30, "score_experience": 12, "score_education": 6,
+                                              "score_languages": 9, "score_extras": 3}), (60, "stretch"))
+        self.assertEqual(scanner.total_score({"score": 64}), (64, "stretch"))   # older single-score answers
+
+    def test_reasoning_comes_first_and_parts_are_saved(self):
+        self.assertEqual(scanner.SCHEMA["propertyOrdering"][0], "requirements_check")
+        answer = {**GEMINI_RESULT, "requirements_check": [{"requirement": "Excel", "status": "met"}],
+                  "score_requirements": 50, "score_experience": 15, "score_education": 6,
+                  "score_languages": 10, "score_extras": 9}
+        answer.pop("score")
+        reply = mock.Mock(status_code=200)
+        reply.json.return_value = {"candidates": [{"content": {"parts": [{"text": json.dumps(answer)}]}}],
+                                   "usageMetadata": {}}
+        with mock.patch.object(scanner.requests, "post", return_value=reply) as post:
+            r = scanner.score_offer({"title": "A", "company": "B", "location": "C"}, "desc", "p",
+                                    scanner.load_config(), "k")
+        self.assertEqual((r["score"], r["verdict"], r["score_requirements"]), (80, "apply", 40))
+        self.assertNotIn("requirements_check", r)
+        self.assertEqual(post.call_args.kwargs["json"]["generationConfig"]["temperature"], 0)
+        store = Store(Path(":memory:"))
+        store.save_offer({"id": "x", **r})
+        self.assertEqual(store.con.execute("SELECT score_education FROM offers").fetchone()[0], 6)

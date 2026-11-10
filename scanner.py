@@ -163,19 +163,37 @@ def fetch_offers(cfg: dict, seen: set, seen_fps: set, stats: dict) -> list[dict]
 
 
 # ---------------------------------------------------------------- Gemini
-RUBRIC = """You are a strict technical recruiter. Score how well the candidate fits the job offer, 0-100:
-- mandatory requirements: max 40
-- years and type of experience: max 20
-- education: max 15
-- languages: max 10
-- nice-to-haves and industry: max 15
-Subtract points for excluding conditions (e.g. required degree/certificate the candidate lacks,
-required language they don't speak, far more years required). Do NOT penalise work mode (remote/hybrid/office).
-Never assume skills the profile does not state. Answer in English.
+RUBRIC = """You are an experienced recruiter deciding whether to invite this candidate to an interview.
+Score realistically, the way a good recruiter reads a CV - not by keyword matching.
+
+First fill requirements_check: each mandatory requirement and main duty of the offer (short), and whether the
+profile meets it, partly meets it (closely related or transferable experience) or misses it.
+
+Then score each part (the total is their sum, computed for you):
+- score_requirements 0-40: the mandatory requirements and main duties. Full credit for what the profile clearly
+  meets, partial credit for related or transferable experience, none where the profile gives no basis.
+  Weigh by importance: the core of the role counts more than a single secondary duty.
+- score_experience 0-20: years and type of experience. If the offer gives no number of years, judge whether the
+  candidate's experience fits the level of the role.
+- score_education 0-15: full if the required degree/field is met or no degree is required; about 40% for
+  relevant studies in progress or relevant studies not completed; less for an unrelated field.
+- score_languages 0-10: the required languages. A language listed only as an advantage costs at most 1-2 points.
+- score_extras 0-15: nice-to-haves ("an advantage", "preferred", "a plus") and fit with the domain/industry.
+
+Rules:
+- Use only what the profile states and never assume skills it doesn't mention - but DO give partial credit for
+  related experience it does state.
+- Count each missing item once, in the part it belongs to.
+- Items marked as an advantage / preferred are extras only - never treat them as mandatory.
+- Don't penalise work mode, contract type or location.
+- A required degree the candidate lacks, a required language they don't speak, or far more years than they have
+  are serious gaps - score them low in their part.
+
+What the total means: 85+ meets nearly everything; 70-84 good fit, worth applying despite some gaps;
+55-69 partial fit, a stretch; 40-54 weak fit; below 40 a different profile.
 
 one_line_reason: at most ~15 words, the main reason for the score; don't start with "The candidate".
 Strengths: at most 4, each a short phrase (max ~6 words).
-
 Write each gap as a short, reusable skill/requirement name (e.g. "SQL", "SAP", "German C1",
 "3+ years experience") so gaps can be counted across many offers.
 
@@ -183,6 +201,10 @@ Also extract facts from the offer itself (independent of the candidate). Use nul
 does not state something - never guess salaries. Salary: copy the numbers as written, with their
 currency, period (hour/day/month/year) and whether they are gross, net or B2B net ("unknown" if unclear).
 required_tools / nice_to_have_tools: concrete tools and technologies only (Excel, Power BI, SQL, Python, SAP...)."""
+
+# part of the score -> maximum points (the model scores the parts, the code adds them up)
+SCORE_PARTS = {"score_requirements": 40, "score_experience": 20, "score_education": 15,
+               "score_languages": 10, "score_extras": 15}
 
 DEFAULT_ROLE_CATEGORIES = ["data/analytics", "finance", "operations", "engineering",
                            "sales/marketing", "other"]
@@ -201,9 +223,12 @@ def build_schema(cfg: dict) -> dict:
 SCHEMA = {
     "type": "OBJECT",
     "properties": {
-        # --- fit
-        "score": {"type": "INTEGER"},
-        "verdict": {"type": "STRING", "enum": ["apply", "stretch", "skip"]},
+        # --- fit (reasoning first, then the parts of the score)
+        "requirements_check": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "requirement": {"type": "STRING"},
+            "status": {"type": "STRING", "enum": ["met", "partly", "missing"]}},
+            "required": ["requirement", "status"]}},
+        **{k: {"type": "INTEGER"} for k in SCORE_PARTS},
         "seniority": {"type": "STRING", "enum": ["intern", "junior", "mid", "senior", "lead", "unknown"]},
         "strengths": {"type": "ARRAY", "items": {"type": "STRING"}},
         "gaps": {"type": "ARRAY", "items": {"type": "STRING"}},
@@ -225,9 +250,19 @@ SCHEMA = {
         "required_tools": {"type": "ARRAY", "items": {"type": "STRING"}},
         "nice_to_have_tools": {"type": "ARRAY", "items": {"type": "STRING"}},
     },
-    "required": ["score", "verdict", "strengths", "gaps", "one_line_reason",
+    "required": ["requirements_check", *SCORE_PARTS, "strengths", "gaps", "one_line_reason",
                  "role_category", "work_mode", "english_level", "required_tools"],
 }
+SCHEMA["propertyOrdering"] = list(SCHEMA["properties"])  # Gemini writes the requirements check before the scores
+
+
+def total_score(result: dict) -> tuple[int, str]:
+    """Add up the parts (each clamped to its maximum); the verdict follows from the total."""
+    if any(k in result for k in SCORE_PARTS):
+        score = sum(max(0, min(cap, int(result.get(k) or 0))) for k, cap in SCORE_PARTS.items())
+    else:  # older answers that came with a single score
+        score = max(0, min(100, int(result.get("score") or 0)))
+    return score, "apply" if score >= 70 else "stretch" if score >= 55 else "skip"
 
 PERIOD_TO_MONTH = {"hour": 168, "day": 21, "month": 1, "year": 1 / 12}
 
@@ -443,10 +478,14 @@ def score_offer(offer: dict, description: str, profile: str, cfg: dict, api_key:
         f"Title: {offer['title']}\nCompany: {offer['company']}\nLocation: {offer['location']}\n\n"
         f"{description[:12000]}"
     )
-    result = call_gemini(prompt, build_schema(cfg), cfg, api_key)
+    result = call_gemini(prompt, build_schema(cfg), cfg, api_key, temperature=0)  # same offer -> same score
     if not result:
         return None
-    result["score"] = max(0, min(100, int(result.get("score") or 0)))
+    result["score"], result["verdict"] = total_score(result)
+    for k, cap in SCORE_PARTS.items():
+        if k in result:
+            result[k] = max(0, min(cap, int(result[k] or 0)))
+    result.pop("requirements_check", None)
     result["model"] = cfg.get("_last_model") or _models(cfg)[0]
     result.update(normalise_salary(result, cfg))
     return result

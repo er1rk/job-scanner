@@ -179,6 +179,12 @@ CSS = """
 .jc-ring.big {width: 58px; height: 58px; line-height: 52px; border-radius: 29px; font-size: 20px;}
 .jc-reason {font-size: 14px; line-height: 1.5; color: #1f1f1e; margin: 10px 0 6px;}
 .jc-list div {font-size: 13px; line-height: 1.45; color: #52514e; padding-left: 16px; text-indent: -16px; margin: 2px 0;}
+.jc-parts {margin: 4px 0 10px;}
+.jc-part {display: flex; align-items: center; gap: 10px; font-size: 12px; color: #52514e; margin: 3px 0;}
+.jc-part span {width: 92px; flex: none;}
+.jc-part b {width: 38px; text-align: right; font-weight: 600; color: #1f1f1e; flex: none;}
+.jc-bar {flex: 1; height: 6px; background: #ecebe7; border-radius: 3px; overflow: hidden;}
+.jc-bar div {height: 100%; border-radius: 3px;}
 .jc-kanban-head {font-size: 13px; font-weight: 600; color: #52514e; text-transform: uppercase; letter-spacing: .03em;}
 .jc-due {color: #b42318; font-weight: 600;}
 div[class*="st-key-sel-"] {border-color: #2a78d6 !important; box-shadow: 0 0 0 1px #2a78d6;}
@@ -410,11 +416,31 @@ def page_offers():
                 offer_detail(backend, pick.iloc[0], d, threshold)
 
 
+SCORE_PARTS = [("score_requirements", "Requirements", 40), ("score_experience", "Experience", 20),
+               ("score_education", "Education", 15), ("score_languages", "Languages", 10),
+               ("score_extras", "Nice-to-haves", 15)]
+
+
+def breakdown_html(o) -> str:
+    """Where the points came from - one thin bar per part (offers scored before the change have none)."""
+    rows = []
+    for key, label, cap in SCORE_PARTS:
+        v = clean(o.get(key))
+        if v is None:
+            return ""
+        pct = max(0, min(100, round(100 * float(v) / cap)))
+        col = GOOD if pct >= 75 else AMBER if pct >= 45 else "#b42318"
+        rows.append(f"<div class='jc-part'><span>{label}</span><div class='jc-bar'><div style='width:{pct}%;"
+                    f"background:{col}'></div></div><b>{int(v)}/{cap}</b></div>")
+    return "<div class='jc-parts'>" + "".join(rows) + "</div>"
+
+
 def offer_detail(backend, o, d, threshold: int):
     with st.container(border=True):
         st.markdown(card_html(o, threshold, big=True), unsafe_allow_html=True)
         st.markdown(f"<div class='jc-reason'>{html.escape(str(clean(o.get('one_line_reason')) or ''))}</div>",
                     unsafe_allow_html=True)
+        st.markdown(breakdown_html(o), unsafe_allow_html=True)
         plus = "".join(f"<div><span style='color:{GOOD}'>✓</span> {html.escape(x)}</div>" for x in o["strengths"])
         minus = "".join(f"<div><span style='color:#b42318'>✗</span> {html.escape(x)}</div>" for x in o["gaps"])
         c1, c2 = st.columns(2)

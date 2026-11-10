@@ -28,6 +28,14 @@ TOOLS = ["Excel", "SQL", "Power BI", "Jira", "Python", "SAP", "Tableau", "Conflu
 SOURCES = ["linkedin"] * 4 + ["pracuj"] * 3 + ["justjoin"] * 2 + ["nofluffjobs", "rocketjobs"]
 
 
+def parts(score: int) -> list[int]:
+    """Split a demo score into the five parts (40/20/15/10/15) roughly in proportion."""
+    caps = [40, 20, 15, 10, 15]
+    out = [min(c, round(c * score / 100)) for c in caps]
+    out[0] = max(0, min(40, out[0] + score - sum(out)))
+    return out
+
+
 def build(path: str) -> None:
     Path(path).unlink(missing_ok=True)
     st = Store(Path(path))
@@ -41,6 +49,8 @@ def build(path: str) -> None:
             "location": random.choice(CITIES), "url": "https://example.com/offer",
             "first_seen": (now - timedelta(hours=random.uniform(0.5, 24 * 30))).isoformat(),
             "score": score, "verdict": "apply" if score >= 60 else ("stretch" if score >= 40 else "skip"),
+            **dict(zip(["score_requirements", "score_experience", "score_education", "score_languages",
+                        "score_extras"], parts(score))),
             "seniority": "junior", "one_line_reason": "Verification and reporting experience fits; SQL is the main gap.",
             "strengths": ["2 years of KYC verification", "Advanced Excel", "English C2"],
             "gaps": random.sample(GAPS, random.randint(1, 3)), "role_category": cat,

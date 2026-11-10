@@ -119,6 +119,7 @@ EXPORT_COLUMNS = [
     "salary_min_pln_month", "salary_max_pln_month",
     "years_required", "english_level", "polish_required", "required_tools", "nice_to_have_tools",
     "model", "user_label", "status",
+    "score_requirements", "score_experience", "score_education", "score_languages", "score_extras",
 ]
 
 
@@ -140,7 +141,10 @@ class Store:
                                      "gemini_errors": "INTEGER", "tokens_in": "INTEGER", "tokens_out": "INTEGER",
                                      "window_hours": "INTEGER"},
                             "triaged": {"reason": "TEXT"},
-                            "offers": {"fingerprint": "TEXT", "synced": "INTEGER DEFAULT 0"}}.items():
+                            "offers": {"fingerprint": "TEXT", "synced": "INTEGER DEFAULT 0",
+                                       **{c: "INTEGER" for c in ("score_requirements", "score_experience",
+                                                                 "score_education", "score_languages",
+                                                                 "score_extras")}}}.items():
             have = {r[1] for r in self.con.execute(f"PRAGMA table_info({table})")}
             for col, typ in cols.items():
                 if col not in have:
