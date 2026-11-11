@@ -33,16 +33,24 @@ HONESTY - the most important rule:
   bullet - but every claim must be traceable to the master CV or the profile.
 - Keep skill levels honest (e.g. "foundational SQL" stays foundational).
 
-CV content:
-- profile: 3-4 sentences (max 70 words), aimed at this offer's main requirements, in the style of the master
-  profile. No first person, no buzzwords.
-- experience: for every role id give 1-5 bullets (most relevant first). The role closest to the offer gets the
-  most bullets; unrelated roles get 1. Each bullet max ~25 words, starts with a past-tense verb, uses the offer's
-  vocabulary where it truthfully applies.
-- project_bullets: 1-2 bullets for each project (same order as the master).
-- skills: the master skill labels in the order most relevant to the offer; for each, the items most relevant
-  first (you may drop irrelevant items, never add new ones).
+CV content - the master CV is already well written; tailor it, don't flatten it:
+- Start from the master wording. Keep the concrete details of every bullet you use: scale and numbers ("tens of
+  thousands of records"), who adopted or used the result ("adopted by the wider team"), stakeholders and scope
+  ("legal, compliance and cross-functional teams across international markets"). Reword only to bring in the
+  offer's vocabulary where it truthfully applies - never shorten a bullet by dropping its specifics.
+- profile: start from the master profile and shift the emphasis to this offer's main requirements (3-4 sentences,
+  max 75 words). Keep the employer and years, the tools with their honest levels, the AI experience and English
+  C2 when relevant. Banned phrases: "proven track record", "strong analytical mindset", "results-driven",
+  "passionate", "dynamic", "combining technical skills", "data-driven decision-making processes". No first person.
+- experience: for every role id give its bullets, most relevant first. The role closest to the offer gets 4-5
+  bullets, the others 1-2. You may add a bullet built from that role's "facts" when the offer asks for it.
+  Each bullet max ~28 words, starts with a past-tense verb.
+- project_bullets: 2 bullets for each project (same order as the master), from its bullets and facts only - never
+  describe features it doesn't have.
+- skills: the master skill labels in the order most relevant to the offer; for each, the master items most
+  relevant first, copied exactly as written (you may drop irrelevant items, never add or rename).
 - coursework: up to 4 items from the master coursework of the first degree, most relevant first.
+- The CV must fill one A4 page: use the bullet counts above rather than fewer.
 
 Answers (English, first person, natural and specific to this company and offer; 60-110 words each, except the
 practical ones):
@@ -97,6 +105,27 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
 
+def _words(s: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9+#]+", s.lower()))
+
+
+def _match(item: str, allowed: list[str]) -> str | None:
+    """The master item the model meant (exact, or a light rewording of it); None for an invented skill."""
+    n = _norm(item)
+    for a in allowed:
+        if _norm(a) == n:
+            return a
+    w = _words(item)
+    best, score = None, 0.0
+    for a in allowed:
+        aw = _words(a)
+        if w and aw:
+            overlap = len(w & aw) / len(w | aw)
+            if overlap > score:
+                best, score = a, overlap
+    return best if score >= 0.5 else None
+
+
 def merge(master: dict, t: dict) -> dict:
     """Fixed parts from the master, chosen/reworded parts from the model - with fallbacks to the master."""
     by_id = {e.get("id"): [b.strip() for b in e.get("bullets") or [] if b and b.strip()]
@@ -110,12 +139,12 @@ def merge(master: dict, t: dict) -> dict:
         projects.append({**p, "bullets": ([b for b in chosen[0] if b.strip()] if chosen else None)
                          or p.get("bullets") or []})
     master_skills = {k: [str(x) for x in v] for k, v in (master.get("skills") or {}).items()}
-    known = {_norm(x): x for v in master_skills.values() for x in v}
     skills, used = [], set()
     for row in t.get("skills") or []:
         label = row.get("label")
         if label in master_skills and label not in used:
-            items = [known[_norm(x)] for x in row.get("items") or [] if _norm(x) in known]
+            items = list(dict.fromkeys(m for x in row.get("items") or []
+                                       if (m := _match(x, master_skills[label]))))
             skills.append((label, items or master_skills[label]))
             used.add(label)
     skills += [(k, v) for k, v in master_skills.items() if k not in used]  # never lose a skill row
