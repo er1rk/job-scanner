@@ -1329,7 +1329,7 @@ class CvTests(unittest.TestCase):
                 scanner.main()
             search.assert_not_called()
             self.assertIn("exactly this expectation: 8 000 PLN", gem.call_args.args[0])
-            self.assertEqual(gem.call_args.args[2]["gemini_models"][0], "gemini-flash-latest")
+            self.assertEqual(gem.call_args.args[2]["gemini_models"][0], "gemini-3.5-flash")
             mail.assert_not_called()                                   # shown in the app, not e-mailed
             self.assertEqual(save.call_args.args[2:6], ("o1", "CV_Jane_Doe_Acme.pdf", b"%PDF-fake",
                                                         [{"question": "Why us?", "answer": "Because."}]))
