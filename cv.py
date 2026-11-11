@@ -40,7 +40,8 @@ CV content - the master CV is already well written; tailor it, don't flatten it:
   offer's vocabulary where it truthfully applies - never shorten a bullet by dropping its specifics.
 - profile: start from the master profile and shift the emphasis to this offer's main requirements (3-4 sentences,
   max 75 words). Keep the employer and years, the tools with their honest levels, the AI experience and English
-  C2 when relevant. Banned phrases: "proven track record", "strong analytical mindset", "results-driven",
+  C2 when relevant. If the offer requires a tool the candidate has at any level (e.g. SQL), name it in the profile
+  with its honest level ("foundational SQL") - leaving it out reads as not having it. Banned phrases: "proven track record", "strong analytical mindset", "results-driven",
   "passionate", "dynamic", "combining technical skills", "data-driven decision-making processes". No first person.
 - experience: for every role id give its bullets, most relevant first. The role closest to the offer gets 4-5
   bullets, the others 1-2. You may add a bullet built from that role's "facts" when the offer asks for it.
