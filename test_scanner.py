@@ -1276,6 +1276,11 @@ class CvTests(unittest.TestCase):
         self.assertEqual(out["experience"][1]["bullets"], ["Reworded old bullet."])
         self.assertEqual(out["experience"][0]["bullets"], ["Did new things."])        # fallback to the master
         self.assertEqual(out["skills"][0], ("Languages", ["English C2"]))              # German C1 not in master
+        import cv as _cv
+        allowed = ["Python and SQL (coursework, personal project)", "LLM APIs (Gemini)", "GitHub Actions"]
+        self.assertEqual(_cv._match("Python and SQL (coursework)", allowed), allowed[0])   # light rewording kept
+        self.assertEqual(_cv._match("Gemini LLM APIs", allowed), allowed[1])
+        self.assertIsNone(_cv._match("Kubernetes", allowed))
         self.assertNotIn("Invented", dict(out["skills"]))
         self.assertIn("Excel", dict(out["skills"]))                                    # rows are never lost
         self.assertEqual(out["education"][0]["coursework"], ["NLP"])
@@ -1324,7 +1329,7 @@ class CvTests(unittest.TestCase):
                 scanner.main()
             search.assert_not_called()
             self.assertIn("exactly this expectation: 8 000 PLN", gem.call_args.args[0])
-            self.assertEqual(gem.call_args.args[2]["gemini_models"][0], "gemini-flash-latest")
+            self.assertEqual(gem.call_args.args[2]["gemini_models"][0], "gemini-3.5-flash")
             mail.assert_not_called()                                   # shown in the app, not e-mailed
             self.assertEqual(save.call_args.args[2:6], ("o1", "CV_Jane_Doe_Acme.pdf", b"%PDF-fake",
                                                         [{"question": "Why us?", "answer": "Because."}]))
