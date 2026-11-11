@@ -248,7 +248,8 @@ def generate(offer: dict, description: str, master: dict, profile: str, cfg: dic
         description=(description or "")[:12000])
     # a stronger model is worth it here (a few CVs a week); the usual list is the fallback
     models = list(dict.fromkeys([*cfg.get("cv_models", []), *cfg.get("gemini_models", [])]))
-    t = call_gemini(prompt, SCHEMA, {**cfg, "gemini_models": models}, api_key, temperature=0.3)
+    # a whole CV is a long answer - give the stronger model time instead of falling back after 90 s
+    t = call_gemini(prompt, SCHEMA, {**cfg, "gemini_models": models, "gemini_timeout": 240}, api_key, temperature=0.3)
     if not t:
         return None, "Gemini is unavailable right now - try again later."
     answers = [a for a in t.get("answers") or [] if a.get("question") and a.get("answer")]

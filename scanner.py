@@ -380,7 +380,7 @@ def call_gemini(prompt: str, schema: dict, cfg: dict, api_key: str, temperature:
         model = models[rotate % len(models)]
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
-            r = requests.post(url, params={"key": api_key}, json=body, timeout=90)
+            r = requests.post(url, params={"key": api_key}, json=body, timeout=cfg.get("gemini_timeout", 90))
         except requests.RequestException as e:  # timeout / connection drop - try the next model
             print(f"  Gemini {model}: {type(e).__name__}", file=sys.stderr)
             rotate += 1
