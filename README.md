@@ -50,7 +50,8 @@ flowchart LR
 11. **Monitoring:** every run records Gemini calls, failed calls, input/output tokens, time per stage (search, pre-filter, scoring) and per-portal results including description-fetch errors.
 12. **Find offer:** run the workflow with a link (or words from the title/company) in *Find offer* and an e-mail tells you where that offer ended up – scored (score, gaps, e-mailed or not), skipped by the title filter / AI pre-filter / as a duplicate, waiting in the queue, or never returned by a search. Fresh offers are scored before the queue.
 13. **Score one offer:** paste a link in the web app (*Offers → Score an offer from a link*) or in the workflow's *Score one offer* field. The offer is scored whatever the filters say and the result comes by e-mail and appears in the app. Links from the five portals are read with the portal's own reader and keep the ids the searches use, so a later scan doesn't score them twice. Any other page (e.g. a company career site) is read as plain text, and Gemini first pulls out the title, company and location.
-14. If the portals return 0 offers across all searches, the e-mail carries a warning – that usually means the page layout changed or the request was blocked, not that there are no jobs.
+14. **Tailored CV:** *📄 Generate CV* in an offer's details starts a run that sends Gemini (a stronger model, the usual ones as fallback) the master CV (`CV_MASTER` secret, format in `cv_master.example.yaml`), the profile and the offer. The model picks, orders and rewords bullets and skills and writes answers to typical application-form questions; the code keeps names, titles, dates, education and certificates fixed, drops skills that aren't in the master CV, lists roles most recent first and renders a one-page A4 PDF (WeasyPrint, Carlito font – OFL). The result appears under the offer in the app by itself (the app checks every few seconds while the run works): a preview of the page, a download button and the answers ready to copy; a failed attempt shows why. Without Supabase it comes by e-mail instead. Salary and availability for the answers are set in the app's settings.
+15. If the portals return 0 offers across all searches, the e-mail carries a warning – that usually means the page layout changed or the request was blocked, not that there are no jobs.
 
 ## Weekly market & skill-gap report
 All numbers are computed in Python straight from the database; the LLM only receives the aggregates and turns them into at most three learning recommendations, so it cannot invent counts.
@@ -114,7 +115,7 @@ The repo is public; everything personal stays out of it:
 ## Setup
 1. Get a Gemini API key at https://aistudio.google.com/apikey
 2. Create a Gmail app password (Google Account → Security → 2-Step Verification → App passwords)
-3. Add repository secrets: `GEMINI_API_KEY`, `CANDIDATE_PROFILE`, `EMAIL_ADDRESS`, `EMAIL_APP_PASSWORD`, `DB_ENCRYPTION_KEY` (a long random passphrase – keep a copy, without it the stored data can't be read), `PRIVATE_CONFIG` (your search settings in the format of `config.private.example.yaml`); optional `EMAIL_TO`
+3. Add repository secrets: `GEMINI_API_KEY`, `CANDIDATE_PROFILE`, `EMAIL_ADDRESS`, `EMAIL_APP_PASSWORD`, `DB_ENCRYPTION_KEY` (a long random passphrase – keep a copy, without it the stored data can't be read), `PRIVATE_CONFIG` (your search settings in the format of `config.private.example.yaml`); optional `EMAIL_TO` and `CV_MASTER` (for tailored CVs)
 4. Actions → *Daily job scan* → *Run workflow* to test (tick *Attach the full dataset* / *Send the weekly report* to get them right away)
 
 Local use:

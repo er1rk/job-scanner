@@ -19,7 +19,8 @@ import requests
 
 BATCH = 500
 SETTING_KEYS = {"keywords": list, "locations": list, "include_title_keywords": list,
-                "exclude_title_keywords": list, "min_score_to_notify": int}
+                "exclude_title_keywords": list, "min_score_to_notify": int,
+                "cv_salary": str, "cv_availability": str}
 OFFER_COLUMNS = [
     "id", "source", "first_seen", "title", "company", "location", "url", "search_keyword", "score", "verdict",
     "seniority", "one_line_reason", "strengths", "gaps", "notified", "role_category", "industry", "work_mode",
@@ -127,6 +128,8 @@ def load_settings(url: str, key: str) -> dict:
             out[k] = [x.strip() for x in v if x.strip()]
         elif want is int and isinstance(v, (int, float)) and 0 <= v <= 100:
             out[k] = int(v)
+        elif want is str and isinstance(v, str) and v.strip():
+            out[k] = v.strip()[:200]
     return out
 
 
@@ -135,3 +138,13 @@ def load_feedback(url: str, key: str, limit: int = 200) -> list[dict]:
     rows = Supabase(url, key).select("feedback", f"select=id,source,title,company,location,url,reason"
                                                  f"&order=marked_at.desc&limit={limit}")
     return [r for r in rows if isinstance(r, dict) and r.get("id") and r.get("title")]
+
+
+def save_cv(url: str, key: str, offer_id: str, file_name: str | None, pdf: bytes | None, answers: list[dict],
+            error: str = "") -> None:
+    """The latest tailored CV per offer for the app (PDF as base64 - a few dozen KB), or why it failed."""
+    import base64
+    Supabase(url, key).upsert("cvs", [{
+        "offer_id": offer_id, "file_name": file_name, "pdf_base64": base64.b64encode(pdf).decode() if pdf else None,
+        "answers": answers, "error": error or None,
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()}], key="offer_id")

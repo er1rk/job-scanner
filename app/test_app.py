@@ -199,6 +199,49 @@ class FeedbackSupabaseTests(unittest.TestCase):
         self.assertEqual((t2, [o[0] for o in ops2]), ("feedback", ["delete", "in_"]))
 
 
+PDF = (b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj 2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj "
+       b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF")
+
+
+class CvSectionTests(unittest.TestCase):
+    def test_generated_cv_can_be_downloaded(self):
+        import base64
+        from data import SupabaseBackend
+        from streamlit.testing.v1 import AppTest
+        offer = {"id": "o1", "title": "Analyst", "company": "Acme", "score": 80, "first_seen": "2026-11-10T06:00:00+00:00",
+                 "notified": True, "gaps": [], "strengths": [], "contract_types": [], "required_tools": [],
+                 "nice_to_have_tools": []}
+        cvs = [{"offer_id": "o1", "file_name": "CV_X_Acme.pdf", "pdf_base64": base64.b64encode(PDF).decode(),
+                "answers": [{"question": "Why us?", "answer": "Because."}], "created_at": "2026-11-10T10:00:00+00:00"}]
+        env = {k: v for k, v in os.environ.items() if k not in ("APP_BACKEND", "LOCAL_DB")}
+        with mock.patch.dict(os.environ, {**env, "APP_START_PAGE": "offers"}, clear=True):
+            at = AppTest.from_file(str(APP), default_timeout=60)
+            at.session_state["backend"] = SupabaseBackend(FakeClient({"offers": [offer], "cvs": cvs}))
+            at.session_state["sel"] = "o1"
+            at.run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertTrue(any(b.label == "📄 New CV for this offer" for b in at.button))
+        self.assertIn("Because.", " ".join(c.value for c in at.code))
+
+    def test_failed_attempt_is_explained(self):
+        from data import SupabaseBackend
+        from streamlit.testing.v1 import AppTest
+        offer = {"id": "o1", "title": "Analyst", "company": "Acme", "score": 80, "first_seen": "2026-11-10T06:00:00+00:00",
+                 "notified": True, "gaps": [], "strengths": [], "contract_types": [], "required_tools": [],
+                 "nice_to_have_tools": []}
+        cvs = [{"offer_id": "o1", "file_name": None, "pdf_base64": None, "answers": [], "error": "No master CV",
+                "created_at": "2026-11-10T10:00:00+00:00"}]
+        env = {k: v for k, v in os.environ.items() if k not in ("APP_BACKEND", "LOCAL_DB")}
+        with mock.patch.dict(os.environ, {**env, "APP_START_PAGE": "offers"}, clear=True):
+            at = AppTest.from_file(str(APP), default_timeout=60)
+            at.session_state["backend"] = SupabaseBackend(FakeClient({"offers": [offer], "cvs": cvs}))
+            at.session_state["sel"] = "o1"
+            at.run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertIn("No master CV", " ".join(e.value for e in at.error))
+        self.assertTrue(any(b.label == "📄 Generate CV" for b in at.button))
+
+
 class EmptySupabaseTests(unittest.TestCase):
     """A fresh Supabase project before the first sync: every table empty (they come back without columns)."""
     def test_app_renders_with_empty_tables(self):

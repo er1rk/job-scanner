@@ -451,6 +451,72 @@ def breakdown_html(o) -> str:
     return "<div class='jc-parts'>" + "".join(rows) + "</div>"
 
 
+def cv_preview(pdf: bytes):
+    """First page of the PDF as an image (browsers block PDFs embedded from data)."""
+    try:
+        import pypdfium2 as pdfium
+        page = pdfium.PdfDocument(pdf)[0]
+        return page.render(scale=2).to_pil()
+    except Exception:
+        return None
+
+
+def cv_section(backend, o) -> None:
+    """Generate a CV tailored to this offer (GitHub Actions + Gemini); preview and download it here."""
+    oid = str(o["id"])
+    wait_key = f"cv-wait-{oid}"
+
+    @st.fragment(run_every=8 if st.session_state.get(wait_key) else None)
+    def body():
+        try:
+            made = backend.cv(oid)
+        except Exception:  # cvs table not created yet
+            made = None
+        asked = st.session_state.get(wait_key)
+        created = pd.to_datetime((made or {}).get("created_at"), utc=True)
+        if asked and made and pd.notna(created) and created >= asked - pd.Timedelta(seconds=30):
+            st.session_state.pop(wait_key)  # the new CV (or its error) has arrived
+            asked = None
+            st.rerun()
+        if asked:
+            waited = (pd.Timestamp.now(tz="UTC") - asked).total_seconds()
+            if waited < 420:
+                st.info(f"⏳ Generating the CV… usually about 2 minutes ({waited:.0f} s so far). It appears here "
+                        "by itself.")
+                return
+            st.session_state.pop(wait_key)
+            st.warning("The CV didn't arrive in 7 minutes – check the run in GitHub Actions, then try again.")
+        has_pdf = bool(made and made.get("pdf_base64"))
+        if st.button("📄 New CV for this offer" if has_pdf else "📄 Generate CV", key=f"cv-{oid}", width="stretch",
+                     type="secondary" if has_pdf else "primary"):
+            ok, msg = dispatch_scan({"cv_offer": oid})
+            if ok:
+                st.session_state[wait_key] = pd.Timestamp.now(tz="UTC")
+                st.rerun()
+            st.error(msg)
+        if made and made.get("error") and not has_pdf:
+            st.error(f"The last attempt failed: {made['error']}")
+        if has_pdf:
+            import base64
+            pdf = base64.b64decode(made["pdf_base64"])
+            when = created.tz_convert("Europe/Warsaw").strftime("%d %b %H:%M") if pd.notna(created) else ""
+            st.download_button("⬇ Download CV (PDF)", pdf, file_name=made.get("file_name") or "CV.pdf",
+                               mime="application/pdf", key=f"cvd-{oid}", width="stretch", type="primary")
+            with st.expander(f"CV preview · made {when}", expanded=True):
+                img = cv_preview(pdf)
+                if img is not None:
+                    st.image(img, width="stretch")
+                else:
+                    st.caption("Preview unavailable – download the PDF.")
+            if made.get("answers"):
+                with st.expander("Answers for the application form"):
+                    for a in made["answers"]:
+                        st.markdown(f"**{a.get('question', '')}**")
+                        st.code(a.get("answer", ""), language=None, wrap_lines=True)
+
+    body()
+
+
 def offer_detail(backend, o, d, threshold: int):
     with st.container(border=True):
         st.markdown(card_html(o, threshold, big=True), unsafe_allow_html=True)
@@ -470,6 +536,7 @@ def offer_detail(backend, o, d, threshold: int):
         quick_actions(backend, d, o, f"detail-{o['id']}")
         if clean(o.get("url")):
             st.link_button("Open offer ↗", o["url"], width="stretch")
+        cv_section(backend, o)
 
         apps = d["apps"]
         mine = apps[apps["offer_id"] == o["id"]]
@@ -571,10 +638,16 @@ def page_scanner():
         inc = c3.text_area("Title must contain one of", "\n".join(s.get("include_title_keywords", [])), height=140)
         exc = c4.text_area("Skip titles with (whole words, * = stem)", "\n".join(s.get("exclude_title_keywords", [])), height=140)
         score = st.number_input("Minimum score for the e-mail", 0, 100, int(s.get("min_score_to_notify", 60)), step=5)
+        st.markdown("**For generated CVs** – used in the form answers; leave empty to get a placeholder")
+        c5, c6 = st.columns(2)
+        salary = c5.text_input("Salary expectation", s.get("cv_salary", ""), placeholder="e.g. 8 000 PLN gross / month")
+        avail = c6.text_input("Availability / notice period", s.get("cv_availability", ""),
+                              placeholder="e.g. available immediately")
         if st.form_submit_button("Save settings", type="primary"):
             lines = lambda t: [x.strip() for x in t.splitlines() if x.strip()]
             for key, val in (("keywords", lines(kw)), ("locations", lines(loc)), ("include_title_keywords", lines(inc)),
-                             ("exclude_title_keywords", lines(exc)), ("min_score_to_notify", int(score))):
+                             ("exclude_title_keywords", lines(exc)), ("min_score_to_notify", int(score)),
+                             ("cv_salary", salary.strip()), ("cv_availability", avail.strip())):
                 backend.save_setting(key, val)
             d["settings"] = backend.settings()
             st.toast("Settings saved – used from the next scan")
