@@ -146,6 +146,7 @@ create table if not exists cvs (
   file_name  text,
   pdf_base64 text,
   answers    jsonb,
+  error      text,                -- why the last attempt failed (no PDF then)
   created_at timestamptz default now()
 );
 

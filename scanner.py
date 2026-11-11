@@ -909,22 +909,26 @@ def main() -> None:
         print(f"Find offer: {sum(len(v) for v in found.values())} match(es) e-mailed")  # count only - logs are public
         close_db(store)
         return
-    if os.getenv("CV_OFFER", "").strip():  # "Generate CV" from the app
+    if os.getenv("CV_OFFER", "").strip():  # "Generate CV" from the app - the result is shown in the app
         offer, name, pdf, extra = make_cv(os.environ["CV_OFFER"].strip(), store, cfg, profile, api_key)
         print("CV generated" if pdf else "CV not generated")  # no details - logs are public
-        try:
-            send_html(f"CV: {offer.get('title') or 'offer'} – {offer.get('company') or ''}" if pdf
-                      else "CV: couldn't generate it",
-                      build_cv_email(offer, extra if pdf else None, "" if pdf else extra),
-                      files=[(name, pdf)] if pdf else None)
-        except Exception as e:
-            print(f"E-mail failed: {type(e).__name__}", file=sys.stderr)
-        if pdf and sb_url and sb_key:
+        saved = False
+        if sb_url and sb_key:
             try:
-                supabase_sync.save_cv(sb_url, sb_key, offer["id"], name, pdf, extra)
+                supabase_sync.save_cv(sb_url, sb_key, offer["id"], name, pdf, extra if pdf else [],
+                                      "" if pdf else extra)
+                saved = True
                 print("CV saved to the app")
             except Exception as e:
                 print(f"Saving the CV to the app failed: {str(e)[:200]}", file=sys.stderr)
+        if not saved:  # no app to show it in - fall back to e-mail
+            try:
+                send_html(f"CV: {offer.get('title') or 'offer'} – {offer.get('company') or ''}" if pdf
+                          else "CV: couldn't generate it",
+                          build_cv_email(offer, extra if pdf else None, "" if pdf else extra),
+                          files=[(name, pdf)] if pdf else None)
+            except Exception as e:
+                print(f"E-mail failed: {type(e).__name__}", file=sys.stderr)
         close_db(store)
         return
     if os.getenv("SCORE_URL", "").strip():  # "Score one offer": a pasted link, scored whatever the filters say

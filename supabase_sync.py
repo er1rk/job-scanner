@@ -140,10 +140,11 @@ def load_feedback(url: str, key: str, limit: int = 200) -> list[dict]:
     return [r for r in rows if isinstance(r, dict) and r.get("id") and r.get("title")]
 
 
-def save_cv(url: str, key: str, offer_id: str, file_name: str, pdf: bytes, answers: list[dict]) -> None:
-    """The latest tailored CV per offer, for download in the app (PDF as base64 - a few dozen KB)."""
+def save_cv(url: str, key: str, offer_id: str, file_name: str | None, pdf: bytes | None, answers: list[dict],
+            error: str = "") -> None:
+    """The latest tailored CV per offer for the app (PDF as base64 - a few dozen KB), or why it failed."""
     import base64
     Supabase(url, key).upsert("cvs", [{
-        "offer_id": offer_id, "file_name": file_name, "pdf_base64": base64.b64encode(pdf).decode(),
-        "answers": answers, "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()}],
-        key="offer_id")
+        "offer_id": offer_id, "file_name": file_name, "pdf_base64": base64.b64encode(pdf).decode() if pdf else None,
+        "answers": answers, "error": error or None,
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()}], key="offer_id")

@@ -451,30 +451,70 @@ def breakdown_html(o) -> str:
     return "<div class='jc-parts'>" + "".join(rows) + "</div>"
 
 
-def cv_section(backend, o) -> None:
-    """Generate a CV tailored to this offer (GitHub Actions + Gemini) and download the latest one."""
+def cv_preview(pdf: bytes):
+    """First page of the PDF as an image (browsers block PDFs embedded from data)."""
     try:
-        made = backend.cv(o["id"])
-    except Exception:  # cvs table not created yet
-        made = None
-    c1, c2 = st.columns(2)
-    if c1.button("📄 Generate CV" if not made else "📄 New CV", key=f"cv-{o['id']}", width="stretch"):
-        ok, msg = dispatch_scan({"cv_offer": str(o["id"])})
-        if ok:
-            st.success("Generating – the CV comes by e-mail in about 2 minutes and appears here after "
-                       "**↻ Refresh data**.")
-        else:
+        import pypdfium2 as pdfium
+        page = pdfium.PdfDocument(pdf)[0]
+        return page.render(scale=2).to_pil()
+    except Exception:
+        return None
+
+
+def cv_section(backend, o) -> None:
+    """Generate a CV tailored to this offer (GitHub Actions + Gemini); preview and download it here."""
+    oid = str(o["id"])
+    wait_key = f"cv-wait-{oid}"
+
+    @st.fragment(run_every=8 if st.session_state.get(wait_key) else None)
+    def body():
+        try:
+            made = backend.cv(oid)
+        except Exception:  # cvs table not created yet
+            made = None
+        asked = st.session_state.get(wait_key)
+        created = pd.to_datetime((made or {}).get("created_at"), utc=True)
+        if asked and made and pd.notna(created) and created >= asked - pd.Timedelta(seconds=30):
+            st.session_state.pop(wait_key)  # the new CV (or its error) has arrived
+            asked = None
+            st.rerun()
+        if asked:
+            waited = (pd.Timestamp.now(tz="UTC") - asked).total_seconds()
+            if waited < 420:
+                st.info(f"⏳ Generating the CV… usually about 2 minutes ({waited:.0f} s so far). It appears here "
+                        "by itself.")
+                return
+            st.session_state.pop(wait_key)
+            st.warning("The CV didn't arrive in 7 minutes – check the run in GitHub Actions, then try again.")
+        has_pdf = bool(made and made.get("pdf_base64"))
+        if st.button("📄 New CV for this offer" if has_pdf else "📄 Generate CV", key=f"cv-{oid}", width="stretch",
+                     type="secondary" if has_pdf else "primary"):
+            ok, msg = dispatch_scan({"cv_offer": oid})
+            if ok:
+                st.session_state[wait_key] = pd.Timestamp.now(tz="UTC")
+                st.rerun()
             st.error(msg)
-    if made:
-        import base64
-        c2.download_button("⬇ Download CV", base64.b64decode(made["pdf_base64"]), file_name=made["file_name"],
-                           mime="application/pdf", key=f"cvd-{o['id']}", width="stretch")
-        when = pd.to_datetime(made.get("created_at"), utc=True)
-        with st.expander(f"Form answers · CV from {when.tz_convert('Europe/Warsaw'):%d %b %H:%M}"
-                         if pd.notna(when) else "Form answers"):
-            for a in made.get("answers") or []:
-                st.markdown(f"**{a.get('question', '')}**")
-                st.code(a.get("answer", ""), language=None, wrap_lines=True)
+        if made and made.get("error") and not has_pdf:
+            st.error(f"The last attempt failed: {made['error']}")
+        if has_pdf:
+            import base64
+            pdf = base64.b64decode(made["pdf_base64"])
+            when = created.tz_convert("Europe/Warsaw").strftime("%d %b %H:%M") if pd.notna(created) else ""
+            st.download_button("⬇ Download CV (PDF)", pdf, file_name=made.get("file_name") or "CV.pdf",
+                               mime="application/pdf", key=f"cvd-{oid}", width="stretch", type="primary")
+            with st.expander(f"CV preview · made {when}", expanded=True):
+                img = cv_preview(pdf)
+                if img is not None:
+                    st.image(img, width="stretch")
+                else:
+                    st.caption("Preview unavailable – download the PDF.")
+            if made.get("answers"):
+                with st.expander("Answers for the application form"):
+                    for a in made["answers"]:
+                        st.markdown(f"**{a.get('question', '')}**")
+                        st.code(a.get("answer", ""), language=None, wrap_lines=True)
+
+    body()
 
 
 def offer_detail(backend, o, d, threshold: int):

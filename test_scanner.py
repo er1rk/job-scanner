@@ -1325,11 +1325,16 @@ class CvTests(unittest.TestCase):
             search.assert_not_called()
             self.assertIn("exactly this expectation: 8 000 PLN", gem.call_args.args[0])
             self.assertEqual(gem.call_args.args[2]["gemini_models"][0], "gemini-flash-latest")
-            subject, body = mail.call_args.args
-            self.assertEqual(subject, "CV: Analyst – Acme")
-            self.assertIn("Because.", body)
-            self.assertEqual(mail.call_args.kwargs["files"], [("CV_Jane_Doe_Acme.pdf", b"%PDF-fake")])
-            self.assertEqual(save.call_args.args[2:4], ("o1", "CV_Jane_Doe_Acme.pdf"))
+            mail.assert_not_called()                                   # shown in the app, not e-mailed
+            self.assertEqual(save.call_args.args[2:6], ("o1", "CV_Jane_Doe_Acme.pdf", b"%PDF-fake",
+                                                        [{"question": "Why us?", "answer": "Because."}]))
+            self.assertEqual(save.call_args.args[6], "")
+
+    def test_cv_errors_reach_the_app(self):
+        with mock.patch.object(supabase_sync.requests, "request", return_value=mock.Mock(status_code=201)) as req:
+            supabase_sync.save_cv("https://s", "k", "o1", None, None, [], "No master CV")
+        row = req.call_args.kwargs["json"][0]
+        self.assertEqual((row["pdf_base64"], row["error"]), (None, "No master CV"))
 
     def test_problems_are_mailed(self):
         store = Store(Path(":memory:"))
